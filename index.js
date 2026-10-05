@@ -238,4 +238,5 @@ process.on('SIGTERM', () => {
 
 // No Render, espera um pouco antes de conectar: no deploy a instância antiga ainda está rodando
 setTimeout(start, process.env.RENDER ? 15000 : 0)
+
       

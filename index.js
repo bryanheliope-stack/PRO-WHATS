@@ -95,6 +95,7 @@ const digits = (jid = '') => jid.split('@')[0].split(':')[0]
 
 // ---------- Sessão (MongoDB se tiver MONGODB_URI, senão pasta ./auth) ----------
 let mongoCol
+let currentSock
 async function getAuth() {
   if (!MONGODB_URI) return useMultiFileAuthState('./auth')
   if (!mongoCol) {
@@ -125,6 +126,7 @@ async function start() {
     browser: ['Ubuntu', 'Chrome', '22.04.4'],
     markOnlineOnConnect: false,
   })
+  currentSock = sock
 
   // Pareamento por código (sem QR) — ideal quando o WhatsApp está no mesmo aparelho
   if (!sock.authState.creds.registered) {
@@ -225,4 +227,15 @@ async function start() {
   })
 }
 
-start()
+// Encerra na hora quando o Render manda desligar a instância antiga (evita duas instâncias
+// mexendo na mesma sessão do WhatsApp, que causa erro "Bad MAC")
+process.on('SIGTERM', () => {
+  try {
+    currentSock?.ws?.close()
+  } catch {}
+  process.exit(0)
+})
+
+// No Render, espera um pouco antes de conectar: no deploy a instância antiga ainda está rodando
+setTimeout(start, process.env.RENDER ? 15000 : 0)
+      

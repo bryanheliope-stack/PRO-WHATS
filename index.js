@@ -1,12 +1,8 @@
-import baileys from '@whiskeysockets/baileys'
 import pino from 'pino'
 import http from 'node:http'
 import { MongoClient } from 'mongodb'
 import { useMongoAuthState } from './mongoAuth.js'
-
-// Baileys 6.x é CommonJS: pega tudo pelo import default
-const makeWASocket = baileys.default ?? baileys
-const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = baileys
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } from './baileys.js'
 
 // Servidor mínimo: o Render (Web Service) exige uma porta aberta, e dá pra
 // usar essa URL num pinger (UptimeRobot) pra evitar que o plano free durma.
@@ -93,7 +89,15 @@ let mongoCol
 async function getAuth() {
   if (!MONGODB_URI) return useMultiFileAuthState('./auth')
   if (!mongoCol) {
-    const client = new MongoClient(MONGODB_URI)
+    // limpa erros comuns de colagem: espaços, aspas, "MONGODB_URI=" na frente
+    const uri = MONGODB_URI.trim().replace(/^MONGODB_URI\s*=\s*/, '').replace(/^["']|["']$/g, '')
+    if (!/^mongodb(\+srv)?:\/\//.test(uri)) {
+      console.error(
+        `MONGODB_URI inválida: precisa começar com mongodb+srv:// (o seu começa com "${uri.slice(0, 12)}")`
+      )
+      process.exit(1)
+    }
+    const client = new MongoClient(uri)
     await client.connect()
     mongoCol = client.db('whatsapp_bot').collection('auth')
   }
@@ -200,4 +204,3 @@ async function start() {
 }
 
 start()
-                                                        

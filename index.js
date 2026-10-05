@@ -295,6 +295,15 @@ process.on('SIGTERM', () => {
 
 // No Render, espera um pouco antes de conectar: no deploy a instância antiga ainda está rodando
 setTimeout(start, process.env.RENDER ? 15000 : 0)
+                          ERM', () => {
+  try {
+    currentSock?.ws?.close()
+  } catch {}
+  process.exit(0)
+})
+
+// No Render, espera um pouco antes de conectar: no deploy a instância antiga ainda está rodando
+setTimeout(start, process.env.RENDER ? 15000 : 0)
       rocess.exit(0)
 })
 

@@ -1,12 +1,12 @@
-import makeWASocket, {
-  useMultiFileAuthState,
-  DisconnectReason,
-  fetchLatestBaileysVersion,
-} from '@whiskeysockets/baileys'
+import baileys from '@whiskeysockets/baileys'
 import pino from 'pino'
 import http from 'node:http'
 import { MongoClient } from 'mongodb'
 import { useMongoAuthState } from './mongoAuth.js'
+
+// Baileys 6.x é CommonJS: pega tudo pelo import default
+const makeWASocket = baileys.default ?? baileys
+const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = baileys
 
 // Servidor mínimo: o Render (Web Service) exige uma porta aberta, e dá pra
 // usar essa URL num pinger (UptimeRobot) pra evitar que o plano free durma.
@@ -200,3 +200,4 @@ async function start() {
 }
 
 start()
+                                                        

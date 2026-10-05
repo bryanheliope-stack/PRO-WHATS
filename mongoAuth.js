@@ -1,6 +1,4 @@
-import baileys from '@whiskeysockets/baileys'
-
-const { initAuthCreds, BufferJSON, proto } = baileys
+import { initAuthCreds, BufferJSON, proto } from './baileys.js'
 
 // Guarda a sessão do Baileys numa collection do MongoDB (mesma interface do useMultiFileAuthState)
 export async function useMongoAuthState(collection) {
@@ -52,4 +50,5 @@ export async function useMongoAuthState(collection) {
     },
     saveCreds: () => write(creds, 'creds'),
   }
-}
+        }
+      

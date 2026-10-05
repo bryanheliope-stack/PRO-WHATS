@@ -24,13 +24,13 @@ if (SELF_URL) {
 
 const {
   PHONE_NUMBER,
-  AI_PROVIDER = 'gemini',
+  AI_PROVIDER = 'nvidia',
   GEMINI_API_KEY,
   GEMINI_MODEL = 'gemini-3.8-flash',
   DEEPSEEK_API_KEY,
   DEEPSEEK_MODEL = 'deepseek-chat',
   NVIDIA_API_KEY,
-  NVIDIA_MODEL = 'meta/llama-3.3-70b-instruct',
+  NVIDIA_MODEL = 'z-ai/glm-5.3',
   TRIGGER = '!ia',
   COOLDOWN = '2',
   MONGODB_URI,
@@ -66,6 +66,7 @@ async function askGemini(messages) {
           parts: [{ text: m.content }],
         })),
       }),
+      signal: AbortSignal.timeout(30000),
     }
   )
   if (!res.ok) throw await httpFail('Gemini', res)
@@ -81,8 +82,9 @@ async function askOpenAICompat(name, url, key, model, messages) {
     body: JSON.stringify({
       model,
       messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...messages],
-      max_tokens: 1024,
+      max_tokens: 4096,
     }),
+    signal: AbortSignal.timeout(60000),
   })
   if (!res.ok) throw await httpFail(name, res)
   const data = await res.json()
@@ -289,6 +291,11 @@ process.on('SIGTERM', () => {
     currentSock?.ws?.close()
   } catch {}
   process.exit(0)
+})
+
+// No Render, espera um pouco antes de conectar: no deploy a instância antiga ainda está rodando
+setTimeout(start, process.env.RENDER ? 15000 : 0)
+      rocess.exit(0)
 })
 
 // No Render, espera um pouco antes de conectar: no deploy a instância antiga ainda está rodando

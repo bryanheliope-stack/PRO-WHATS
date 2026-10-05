@@ -29,6 +29,8 @@ const {
   GEMINI_MODEL = 'gemini-3.8-flash',
   DEEPSEEK_API_KEY,
   DEEPSEEK_MODEL = 'deepseek-chat',
+  NVIDIA_API_KEY,
+  NVIDIA_MODEL = 'meta/llama-3.3-70b-instruct',
   TRIGGER = '!ia',
   COOLDOWN = '2',
   MONGODB_URI,
@@ -43,6 +45,14 @@ const history = new Map() // chatId -> [{ role: 'user' | 'assistant', content }]
 const lastUse = new Map() // sender -> timestamp
 
 // ---------- IA ----------
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+async function httpFail(name, res) {
+  const err = new Error(`${name} ${res.status}: ${(await res.text()).slice(0, 300)}`)
+  err.status = res.status
+  return err
+}
+
 async function askGemini(messages) {
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
@@ -58,30 +68,64 @@ async function askGemini(messages) {
       }),
     }
   )
-  if (!res.ok) throw new Error(`Gemini ${res.status}: ${await res.text()}`)
+  if (!res.ok) throw await httpFail('Gemini', res)
   const data = await res.json()
   return data.candidates?.[0]?.content?.parts?.map((p) => p.text).join('') ?? ''
 }
 
-async function askDeepseek(messages) {
-  const res = await fetch('https://api.deepseek.com/chat/completions', {
+// DeepSeek e NVIDIA usam o formato OpenAI (chat/completions)
+async function askOpenAICompat(name, url, key, model, messages) {
+  const res = await fetch(url, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${DEEPSEEK_API_KEY}`,
-    },
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
     body: JSON.stringify({
-      model: DEEPSEEK_MODEL,
+      model,
       messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...messages],
+      max_tokens: 1024,
     }),
   })
-  if (!res.ok) throw new Error(`DeepSeek ${res.status}: ${await res.text()}`)
+  if (!res.ok) throw await httpFail(name, res)
   const data = await res.json()
   return data.choices?.[0]?.message?.content ?? ''
 }
 
-const askAI = (messages) =>
-  AI_PROVIDER === 'deepseek' ? askDeepseek(messages) : askGemini(messages)
+const providers = {
+  gemini: { key: GEMINI_API_KEY, ask: askGemini },
+  nvidia: {
+    key: NVIDIA_API_KEY,
+    ask: (m) =>
+      askOpenAICompat('NVIDIA', 'https://integrate.api.nvidia.com/v1/chat/completions', NVIDIA_API_KEY, NVIDIA_MODEL, m),
+  },
+  deepseek: {
+    key: DEEPSEEK_API_KEY,
+    ask: (m) =>
+      askOpenAICompat('DeepSeek', 'https://api.deepseek.com/chat/completions', DEEPSEEK_API_KEY, DEEPSEEK_MODEL, m),
+  },
+}
+
+// Tenta o provedor principal (AI_PROVIDER); se der erro temporário tenta de novo,
+// e se continuar falhando passa pros outros que tiverem chave configurada.
+async function askAI(messages) {
+  const order = [AI_PROVIDER, ...Object.keys(providers).filter((p) => p !== AI_PROVIDER)].filter(
+    (p) => providers[p]?.key
+  )
+  if (!order.length) throw new Error('Nenhuma chave de IA configurada')
+
+  let lastErr
+  for (const name of order) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        return await providers[name].ask(messages)
+      } catch (e) {
+        lastErr = e
+        console.error(`Erro (${name}):`, e.message)
+        if (![429, 500, 502, 503, 504].includes(e.status)) break // erro permanente: próximo provedor
+        await sleep(1500)
+      }
+    }
+  }
+  throw lastErr
+}
 
 // ---------- Helpers ----------
 const getText = (m) =>
@@ -213,7 +257,18 @@ async function start() {
         const chat = history.get(chatId) ?? []
         chat.push({ role: 'user', content: `${name}: ${question}` })
 
-        const answer = (await askAI(chat)).trim() || 'Não consegui pensar numa resposta 😅'
+        let answer
+        try {
+          answer = (await askAI(chat)).trim() || 'Não consegui pensar numa resposta 😅'
+        } catch {
+          chat.pop() // tira a pergunta sem resposta do histórico
+          await sock.sendMessage(
+            chatId,
+            { text: 'A IA está sobrecarregada agora 😅 tenta de novo daqui a pouco.' },
+            { quoted: msg }
+          )
+          continue
+        }
 
         chat.push({ role: 'assistant', content: answer })
         history.set(chatId, chat.slice(-MAX_HISTORY))
@@ -238,5 +293,4 @@ process.on('SIGTERM', () => {
 
 // No Render, espera um pouco antes de conectar: no deploy a instância antiga ainda está rodando
 setTimeout(start, process.env.RENDER ? 15000 : 0)
-
       

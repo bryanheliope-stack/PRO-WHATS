@@ -1,4 +1,6 @@
-import { initAuthCreds, BufferJSON, proto } from '@whiskeysockets/baileys'
+import baileys from '@whiskeysockets/baileys'
+
+const { initAuthCreds, BufferJSON, proto } = baileys
 
 // Guarda a sessão do Baileys numa collection do MongoDB (mesma interface do useMultiFileAuthState)
 export async function useMongoAuthState(collection) {

@@ -25,8 +25,6 @@ if (SELF_URL) {
 const {
   PHONE_NUMBER,
   AI_PROVIDER = 'nvidia',
-  GEMINI_API_KEY,
-  GEMINI_MODEL = 'gemini-3.8-flash',
   DEEPSEEK_API_KEY,
   DEEPSEEK_MODEL = 'deepseek-chat',
   NVIDIA_API_KEY,
@@ -53,28 +51,7 @@ async function httpFail(name, res) {
   return err
 }
 
-async function askGemini(messages) {
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        contents: messages.map((m) => ({
-          role: m.role === 'assistant' ? 'model' : 'user',
-          parts: [{ text: m.content }],
-        })),
-      }),
-      signal: AbortSignal.timeout(30000),
-    }
-  )
-  if (!res.ok) throw await httpFail('Gemini', res)
-  const data = await res.json()
-  return data.candidates?.[0]?.content?.parts?.map((p) => p.text).join('') ?? ''
-}
-
-// DeepSeek e NVIDIA usam o formato OpenAI (chat/completions)
+// NVIDIA e DeepSeek usam o formato OpenAI (chat/completions)
 async function askOpenAICompat(name, url, key, model, messages) {
   const res = await fetch(url, {
     method: 'POST',
@@ -92,7 +69,6 @@ async function askOpenAICompat(name, url, key, model, messages) {
 }
 
 const providers = {
-  gemini: { key: GEMINI_API_KEY, ask: askGemini },
   nvidia: {
     key: NVIDIA_API_KEY,
     ask: (m) =>
@@ -295,3 +271,4 @@ process.on('SIGTERM', () => {
 
 // No Render, espera um pouco antes de conectar: no deploy a instância antiga ainda está rodando
 setTimeout(start, process.env.RENDER ? 15000 : 0)
+    

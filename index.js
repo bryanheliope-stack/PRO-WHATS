@@ -38,9 +38,11 @@ const {
   NVIDIA_CATALOG_CACHE_MS = '3600000',
 } = process.env
 
+// Prompt do sistema otimizado para Winlator e economia de banco
 const SYSTEM_PROMPT =
-  'Você é um assistente dentro de um grupo de WhatsApp. Responda em português do Brasil, ' +
-  'de forma curta, direta e simpática. Sem markdown pesado (WhatsApp só suporta *negrito* e _itálico_).'
+  'Você é um assistente especialista em emulação de PC no Android (Winlator, Mobox, Horizon, etc) dentro de um grupo de WhatsApp. ' +
+  'Responda em português do Brasil, de forma curta, direta e simpática. Sem markdown pesado (use apenas *negrito* e _itálico_). ' +
+  'Se o usuário fornecer uma configuração completa de jogo/aparelho, extraia apenas os dados técnicos necessários.'
 
 const MAX_HISTORY = 10
 const history = new Map()
@@ -48,7 +50,7 @@ const lastUse = new Map()
 
 // ---------- IA ----------
 const NVIDIA_BASE_URL = 'https://integrate.api.nvidia.com/v1'
-const NVIDIA_MODELS_URL = `${NVIDIA_BASE_URL}/models` // catálogo de todos os modelos liberados pela NVIDIA para a chave
+const NVIDIA_MODELS_URL = `${NVIDIA_BASE_URL}/models`
 const NVIDIA_FALLBACK_MODELS = NVIDIA_MODEL.split(',').map((x) => x.trim()).filter(Boolean)
 
 const RETRYABLE_STATUS = new Set([408, 409, 425, 429, 500, 502, 503, 504])
@@ -155,7 +157,6 @@ async function getNvidiaModels(deadline) {
       ? data.data.map((item) => item?.id).filter((id) => typeof id === 'string' && id.trim())
       : []
 
-    // Os modelos indicados no .env vêm primeiro; o restante do catálogo entra depois.
     const models = [...new Set([...NVIDIA_FALLBACK_MODELS, ...discovered])]
     if (!models.length) throw createError('Catálogo da NVIDIA retornou vazio', 502)
 
@@ -242,13 +243,11 @@ async function askWithRotation({ provider, models, messages, deadline, request }
   let lastError
   let round = 0
 
-  // Continua rodando pelos modelos até algum responder ou o prazo total acabar.
   while (remainingTime(deadline) > 0) {
     round++
     const ordered = rotate(uniqueModels, provider)
     let candidates = ordered.filter((model) => availableNow(provider, model))
 
-    // Se todos estiverem marcados como indisponíveis, tenta novamente em ordem rotativa.
     if (!candidates.length) {
       candidates = ordered
       console.warn(`[IA] todos os modelos de ${provider} estão indisponíveis; iniciando nova rodada`)
@@ -265,7 +264,6 @@ async function askWithRotation({ provider, models, messages, deadline, request }
 
     if (remainingTime(deadline) <= 0) break
 
-    // Pequena pausa antes de revisitar modelos que já falharam.
     const pause = Math.min(2000, remainingTime(deadline))
     console.warn(`[IA] rodada ${round} de ${provider} falhou; nova tentativa em ${pause} ms`)
     await sleep(pause)
@@ -351,8 +349,9 @@ const getText = (m) =>
 
 const digits = (jid = '') => jid.split('@')[0].split(':')[0]
 
-// ---------- Sessão ----------
+// ---------- Sessão e Banco de Dados ----------
 let mongoCol
+let configCol
 let currentSock
 
 async function getAuth() {
@@ -372,7 +371,13 @@ async function getAuth() {
 
     const client = new MongoClient(uri)
     await client.connect()
-    mongoCol = client.db('whatsapp_bot').collection('auth')
+    const db = client.db('whatsapp_bot')
+    
+    mongoCol = db.collection('auth')
+    configCol = db.collection('winlator_configs')
+
+    // Índice otimizado para não estourar a cota de 512MB
+    await configCol.createIndex({ game: 1, soc: 1 })
   }
 
   return useMongoAuthState(mongoCol)
@@ -465,7 +470,7 @@ async function start() {
         if (!question) {
           await sock.sendMessage(
             chatId,
-            { text: 'Fala aí, o que você quer saber? 😄' },
+            { text: 'Fala aí, qual jogo ou dúvida sobre o Winlator você quer pesquisar? 😄' },
             { quoted: msg }
           )
           continue
@@ -482,9 +487,24 @@ async function start() {
         lastUse.set(sender, now)
         await sock.sendPresenceUpdate('composing', chatId)
 
+        // Busca rápida de configs salvas no Mongo se for comando específico
+        let dbContext = ''
+        if (configCol && question.toLowerCase().startsWith('config')) {
+          const gameSearch = question.replace(/^config\s*/i, '').trim()
+          if (gameSearch) {
+            const foundConfigs = await configCol.find({
+              game: { $regex: gameSearch,$options: 'i' }
+            }).limit(3).toArray()
+
+            if (foundConfigs.length > 0) {
+              dbContext = `\n(Configs salvas no banco: ${JSON.stringify(foundConfigs)})`
+            }
+          }
+        }
+
         const name = msg.pushName || 'Alguém'
         const chat = history.get(chatId) ?? []
-        chat.push({ role: 'user', content: `${name}: ${question}` })
+        chat.push({ role: 'user', content: `${name}: ${question}${dbContext}` })
 
         let answer
         try {
@@ -521,3 +541,4 @@ process.on('SIGTERM', () => {
 })
 
 setTimeout(start, process.env.RENDER ? 15000 : 0)
+                       

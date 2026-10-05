@@ -28,7 +28,7 @@ const {
   DEEPSEEK_API_KEY,
   DEEPSEEK_MODEL = 'deepseek-chat',
   NVIDIA_API_KEY,
-  NVIDIA_MODEL = 'z-ai/glm-5.3',
+  NVIDIA_MODEL = 'z-ai/glm-5.3-flash,z-ai/glm-5.3',
   TRIGGER = '!ia',
   COOLDOWN = '2',
   MONGODB_URI,
@@ -52,7 +52,7 @@ async function httpFail(name, res) {
 }
 
 // NVIDIA e DeepSeek usam o formato OpenAI (chat/completions)
-async function askOpenAICompat(name, url, key, model, messages) {
+async function askOpenAICompat(name, url, key, model, messages, timeoutMs = 60000) {
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
@@ -61,7 +61,7 @@ async function askOpenAICompat(name, url, key, model, messages) {
       messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...messages],
       max_tokens: 4096,
     }),
-    signal: AbortSignal.timeout(60000),
+    signal: AbortSignal.timeout(timeoutMs),
   })
   if (!res.ok) throw await httpFail(name, res)
   const data = await res.json()
@@ -71,8 +71,27 @@ async function askOpenAICompat(name, url, key, model, messages) {
 const providers = {
   nvidia: {
     key: NVIDIA_API_KEY,
-    ask: (m) =>
-      askOpenAICompat('NVIDIA', 'https://integrate.api.nvidia.com/v1/chat/completions', NVIDIA_API_KEY, NVIDIA_MODEL, m),
+    // NVIDIA_MODEL aceita vários modelos separados por vírgula: tenta na ordem até um responder
+    ask: async (m) => {
+      const models = NVIDIA_MODEL.split(',').map((x) => x.trim()).filter(Boolean)
+      let lastErr
+      for (const model of models) {
+        try {
+          return await askOpenAICompat(
+            'NVIDIA',
+            'https://integrate.api.nvidia.com/v1/chat/completions',
+            NVIDIA_API_KEY,
+            model,
+            m,
+            40000
+          )
+        } catch (e) {
+          lastErr = e
+          console.error(`NVIDIA modelo ${model} falhou:`, e.message.slice(0, 200))
+        }
+      }
+      throw lastErr
+    },
   },
   deepseek: {
     key: DEEPSEEK_API_KEY,
@@ -271,4 +290,4 @@ process.on('SIGTERM', () => {
 
 // No Render, espera um pouco antes de conectar: no deploy a instância antiga ainda está rodando
 setTimeout(start, process.env.RENDER ? 15000 : 0)
-    
+  

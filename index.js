@@ -5,13 +5,13 @@ import path from 'node:path'
 import os from 'node:os'
 import { MongoClient } from 'mongodb'
 import unzipper from 'unzipper'
+import { downloadContentFromMessage } from '@whiskeysockets/baileys'
 import { useMongoAuthState } from './mongoAuth.js'
 import {
   makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
-  fetchLatestBaileysVersion,
-  downloadContentFromMessage
+  fetchLatestBaileysVersion
 } from './baileys.js'
 
 // Servidor mínimo para manter a porta do Render aberta.
@@ -497,7 +497,6 @@ async function start() {
           tempFiles.push(tempZipPath)
           tempDirs.push(extractDir)
 
-          // Unzip o arquivo para leitura
           const directory = await unzipper.Open.file(tempZipPath)
           let extractedTexts = []
 
@@ -587,7 +586,6 @@ async function start() {
       } catch (error) {
         console.error('Erro:', error.message)
       } finally {
-        // --- Exclusão dos ficheiros e diretórios temporários baixados ---
         for (const filePath of tempFiles) {
           try {
             if (fs.existsSync(filePath)) fs.unlinkSync(filePath)
@@ -616,4 +614,4 @@ process.on('SIGTERM', () => {
 })
 
 setTimeout(start, process.env.RENDER ? 15000 : 0)
-                     
+                                     

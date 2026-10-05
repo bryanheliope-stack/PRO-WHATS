@@ -9,6 +9,7 @@
   "dependencies": {
     "@whiskeysockets/baileys": "6.7.22",
     "mongodb": "^6.10.0",
-    "pino": "^9.5.0"
+    "pino": "^9.5.0",
+    "unzipper": "^0.12.3"
   }
 }

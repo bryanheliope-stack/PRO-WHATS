@@ -21,7 +21,7 @@ const {
   DEEPSEEK_API_KEY,
   DEEPSEEK_MODEL = 'deepseek-chat',
   TRIGGER = '!ia',
-  COOLDOWN = '5',
+  COOLDOWN = '2',
   MONGODB_URI,
 } = process.env
 
@@ -167,21 +167,34 @@ async function start() {
         const hasPrefix = text.toLowerCase().startsWith(TRIGGER.toLowerCase())
         if (!hasPrefix && !mentioned) continue
 
-        // Cooldown anti-spam
-        const sender = msg.key.participant || chatId
-        const now = Date.now()
-        if (now - (lastUse.get(sender) ?? 0) < Number(COOLDOWN) * 1000) continue
-        lastUse.set(sender, now)
-
-        // Limpa o texto (tira prefixo e menções)
-        const question = text
+        // Texto da pergunta (tira prefixo e menções)
+        let question = text
           .slice(hasPrefix ? TRIGGER.length : 0)
           .replace(/@\d+/g, '')
           .trim()
+
+        // Se for resposta a outra mensagem, usa o texto citado como contexto
+        const quotedRaw = getText(msg.message.extendedTextMessage?.contextInfo?.quotedMessage).trim()
+        const quoted = quotedRaw.replace(new RegExp(`^${TRIGGER}\\s*`, 'i'), '').trim()
+        if (quoted) {
+          question = question
+            ? `${question}\n\n(Mensagem citada: ${quoted})`
+            : quoted
+        }
+
         if (!question) {
           await sock.sendMessage(chatId, { text: 'Fala aí, o que você quer saber? 😄' }, { quoted: msg })
           continue
         }
+
+        // Cooldown anti-spam (só conta pra perguntas de verdade)
+        const sender = msg.key.participant || chatId
+        const now = Date.now()
+        if (now - (lastUse.get(sender) ?? 0) < Number(COOLDOWN) * 1000) {
+          await sock.sendMessage(chatId, { react: { text: '⏳', key: msg.key } })
+          continue
+        }
+        lastUse.set(sender, now)
 
         await sock.sendPresenceUpdate('composing', chatId)
 
@@ -204,3 +217,4 @@ async function start() {
 }
 
 start()
+                                 

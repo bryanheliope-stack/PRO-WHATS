@@ -17,7 +17,7 @@ const {
   PHONE_NUMBER,
   AI_PROVIDER = 'gemini',
   GEMINI_API_KEY,
-  GEMINI_MODEL = 'gemini-2.5-flash',
+  GEMINI_MODEL = 'gemini-3.8-flash',
   DEEPSEEK_API_KEY,
   DEEPSEEK_MODEL = 'deepseek-chat',
   TRIGGER = '!ia',
@@ -139,8 +139,8 @@ async function start() {
         console.log('Sessão encerrada. Limpando sessão salva, reinicie pra parear de novo.')
         mongoCol?.deleteMany({}).catch(() => {})
       } else {
-        console.log('Conexão caiu, reconectando...')
-        start()
+        console.log('Conexão caiu, reconectando em 3s...')
+        setTimeout(start, 3000)
       }
     }
   })
@@ -217,4 +217,4 @@ async function start() {
 }
 
 start()
-                                 
+  

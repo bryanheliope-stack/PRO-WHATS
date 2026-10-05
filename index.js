@@ -1,8 +1,18 @@
 import pino from 'pino'
 import http from 'node:http'
+import fs from 'node:fs'
+import path from 'node:path'
+import os from 'node:os'
 import { MongoClient } from 'mongodb'
+import unzipper from 'unzipper'
 import { useMongoAuthState } from './mongoAuth.js'
-import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } from './baileys.js'
+import {
+  makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  downloadContentFromMessage
+} from './baileys.js'
 
 // Servidor mínimo para manter a porta do Render aberta.
 http
@@ -38,11 +48,10 @@ const {
   NVIDIA_CATALOG_CACHE_MS = '3600000',
 } = process.env
 
-// Prompt do sistema otimizado para Winlator e economia de banco
 const SYSTEM_PROMPT =
   'Você é um assistente especialista em emulação de PC no Android (Winlator, Mobox, Horizon, etc) dentro de um grupo de WhatsApp. ' +
   'Responda em português do Brasil, de forma curta, direta e simpática. Sem markdown pesado (use apenas *negrito* e _itálico_). ' +
-  'Se o usuário fornecer uma configuração completa de jogo/aparelho, extraia apenas os dados técnicos necessários.'
+  'Se o usuário fornecer uma configuração completa de jogo/aparelho ou arquivo zip/imagem com configs, extraia apenas os dados técnicos necessários.'
 
 const MAX_HISTORY = 10
 const history = new Map()
@@ -339,15 +348,25 @@ async function askAI(messages) {
   throw lastError || createError(`A IA não respondeu em ${TOTAL_TIMEOUT} ms`, 408)
 }
 
-// ---------- Helpers ----------
+// ---------- Helpers & Download de Mídia ----------
 const getText = (m) =>
   m?.conversation ||
   m?.extendedTextMessage?.text ||
   m?.imageMessage?.caption ||
   m?.videoMessage?.caption ||
+  m?.documentMessage?.caption ||
   ''
 
 const digits = (jid = '') => jid.split('@')[0].split(':')[0]
+
+async function saveMediaFile(message, type) {
+  const stream = await downloadContentFromMessage(message, type)
+  let buffer = Buffer.from([])
+  for await (const chunk of stream) {
+    buffer = Buffer.concat([buffer, chunk])
+  }
+  return buffer
+}
 
 // ---------- Sessão e Banco de Dados ----------
 let mongoCol
@@ -372,11 +391,10 @@ async function getAuth() {
     const client = new MongoClient(uri)
     await client.connect()
     const db = client.db('whatsapp_bot')
-    
+
     mongoCol = db.collection('auth')
     configCol = db.collection('winlator_configs')
 
-    // Índice otimizado para não estourar a cota de 512MB
     await configCol.createIndex({ game: 1, soc: 1 })
   }
 
@@ -432,6 +450,9 @@ async function start() {
     if (type !== 'notify') return
 
     for (const msg of messages) {
+      let tempFiles = []
+      let tempDirs = []
+
       try {
         if (!msg.message || msg.key.fromMe) continue
 
@@ -439,8 +460,6 @@ async function start() {
         if (!chatId?.endsWith('@g.us')) continue
 
         const text = getText(msg.message).trim()
-        if (!text) continue
-
         const botNumber = digits(sock.user?.id)
         const botLid = digits(sock.user?.lid)
         const mentioned =
@@ -456,6 +475,44 @@ async function start() {
           .replace(/@\d+/g, '')
           .trim()
 
+        // --- Análise de Arquivos e Imagens ---
+        let fileContext = ''
+        const imageMsg = msg.message.imageMessage
+        const docMsg = msg.message.documentMessage
+
+        if (imageMsg) {
+          const imgBuffer = await saveMediaFile(imageMsg, 'image')
+          const tempImgPath = path.join(os.tmpdir(), `img_${Date.now()}.jpg`)
+          fs.writeFileSync(tempImgPath, imgBuffer)
+          tempFiles.push(tempImgPath)
+          fileContext += `\n(O usuário enviou uma imagem de configuração/erro. Analise o contexto.)`
+        }
+
+        if (docMsg && (docMsg.mimetype?.includes('zip') || docMsg.fileName?.endsWith('.zip'))) {
+          const zipBuffer = await saveMediaFile(docMsg, 'document')
+          const tempZipPath = path.join(os.tmpdir(), `zip_${Date.now()}.zip`)
+          const extractDir = path.join(os.tmpdir(), `dir_${Date.now()}`)
+
+          fs.writeFileSync(tempZipPath, zipBuffer)
+          tempFiles.push(tempZipPath)
+          tempDirs.push(extractDir)
+
+          // Unzip o arquivo para leitura
+          const directory = await unzipper.Open.file(tempZipPath)
+          let extractedTexts = []
+
+          for (const file of directory.files) {
+            if (file.path.endsWith('.txt') || file.path.endsWith('.json') || file.path.endsWith('.ini')) {
+              const content = (await file.buffer()).toString('utf-8')
+              extractedTexts.push(`--- Ficheiro ${file.path} ---\n${content.slice(0, 1000)}`)
+            }
+          }
+
+          if (extractedTexts.length > 0) {
+            fileContext += `\n(Conteúdo extraído do ZIP enviado:\n${extractedTexts.join('\n')})`
+          }
+        }
+
         const quotedRaw = getText(
           msg.message.extendedTextMessage?.contextInfo?.quotedMessage
         ).trim()
@@ -467,7 +524,7 @@ async function start() {
           question = question ? `${question}\n\n(Mensagem citada: ${quoted})` : quoted
         }
 
-        if (!question) {
+        if (!question && !fileContext) {
           await sock.sendMessage(
             chatId,
             { text: 'Fala aí, qual jogo ou dúvida sobre o Winlator você quer pesquisar? 😄' },
@@ -487,7 +544,7 @@ async function start() {
         lastUse.set(sender, now)
         await sock.sendPresenceUpdate('composing', chatId)
 
-        // Busca rápida de configs salvas no Mongo se for comando específico
+        // Busca de configs salvas no MongoDB
         let dbContext = ''
         if (configCol && question.toLowerCase().startsWith('config')) {
           const gameSearch = question.replace(/^config\s*/i, '').trim()
@@ -504,7 +561,7 @@ async function start() {
 
         const name = msg.pushName || 'Alguém'
         const chat = history.get(chatId) ?? []
-        chat.push({ role: 'user', content: `${name}: ${question}${dbContext}` })
+        chat.push({ role: 'user', content: `${name}: ${question}${fileContext}${dbContext}` })
 
         let answer
         try {
@@ -526,8 +583,26 @@ async function start() {
 
         await sock.sendMessage(chatId, { text: answer }, { quoted: msg })
         await sock.sendPresenceUpdate('paused', chatId)
+
       } catch (error) {
         console.error('Erro:', error.message)
+      } finally {
+        // --- Exclusão dos ficheiros e diretórios temporários baixados ---
+        for (const filePath of tempFiles) {
+          try {
+            if (fs.existsSync(filePath)) fs.unlinkSync(filePath)
+          } catch (e) {
+            console.error(`Falha ao excluir arquivo temporário (${filePath}):`, e.message)
+          }
+        }
+
+        for (const dirPath of tempDirs) {
+          try {
+            if (fs.existsSync(dirPath)) fs.rmSync(dirPath, { recursive: true, force: true })
+          } catch (e) {
+            console.error(`Falha ao excluir pasta temporária (${dirPath}):`, e.message)
+          }
+        }
       }
     }
   })
@@ -541,4 +616,4 @@ process.on('SIGTERM', () => {
 })
 
 setTimeout(start, process.env.RENDER ? 15000 : 0)
-                       
+                     

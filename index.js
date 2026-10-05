@@ -13,6 +13,15 @@ http
   })
   .listen(process.env.PORT || 3000)
 
+// Auto-ping: bate na própria URL pública a cada 10 min pra o Render não dormir o serviço.
+// O Render define RENDER_EXTERNAL_URL sozinho; fora dele, use a variável PING_URL.
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || process.env.PING_URL
+if (SELF_URL) {
+  setInterval(() => {
+    fetch(SELF_URL).catch((e) => console.log('auto-ping falhou:', e.message))
+  }, 10 * 60 * 1000)
+}
+
 const {
   PHONE_NUMBER,
   AI_PROVIDER = 'gemini',
@@ -217,4 +226,3 @@ async function start() {
 }
 
 start()
-  

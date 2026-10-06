@@ -1,8 +1,18 @@
 import pino from 'pino'
 import http from 'node:http'
+import fs from 'node:fs'
+import path from 'node:path'
+import os from 'node:os'
 import { MongoClient } from 'mongodb'
+import unzipper from 'unzipper'
+import { downloadContentFromMessage } from '@whiskeysockets/baileys'
 import { useMongoAuthState } from './mongoAuth.js'
-import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } from './baileys.js'
+import {
+  makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion
+} from './baileys.js'
 
 // Servidor mínimo para manter a porta do Render aberta.
 http
@@ -29,26 +39,48 @@ const {
   DEEPSEEK_MODEL = 'deepseek-chat',
   NVIDIA_API_KEY,
   NVIDIA_MODEL = 'z-ai/glm-5.3-flash,z-ai/glm-5.3',
-  TRIGGER = '!ia',
+  TRIGGER = 'nexos', // Gatilho alterado para "nexos"
   COOLDOWN = '2',
   MONGODB_URI,
   MODEL_COOLDOWN_MS = '300000',
   MODEL_RETRIES = '1',
   AI_TOTAL_TIMEOUT_MS = '180000',
   NVIDIA_CATALOG_CACHE_MS = '3600000',
+  SEARCH_MODE = 'auto',
+  SEARCH_MAX_RESULTS = '5',
+  SEARCH_TIMEOUT_MS = '10000',
+  SEARCH_CACHE_MS = '600000',
+  SEARCH_FETCH_PAGES = '1',
+  SEARCH_SHOW_REASONING = '1',
+  SERPER_API_KEY,
+  GOOGLE_API_KEY,
+  GOOGLE_CX,
+  TAVILY_API_KEY,
+  BRAVE_API_KEY,
+  ALLOWED_USERS = '',
+  ONLY_ADMINS = 'false',
 } = process.env
 
 const SYSTEM_PROMPT =
-  'Você é um assistente dentro de um grupo de WhatsApp. Responda em português do Brasil, ' +
-  'de forma curta, direta e simpática. Sem markdown pesado (WhatsApp só suporta *negrito* e _itálico_).'
+  'Você é um assistente chamado Nexos, especialista em emulação de PC no Android (Winlator, Mobox, Horizon, etc) dentro de um grupo de WhatsApp. ' +
+  'Responda em português do Brasil, de forma curta, direta e simpática. Sem markdown pesado (use apenas *negrito* e _itálico_). ' +
+  'Se o usuário fornecer uma configuração completa de jogo/aparelho ou arquivo zip/imagem com configs, extraia apenas os dados técnicos necessários. ' +
+  'REGRA CRÍTICA DE SEGURANÇA: NUNCA compartilhe chaves de API, senhas, URLs de banco de dados, dados pessoais de usuários ou informações de autenticação do sistema.'
+
+const buildSystemPrompt = () =>
+  `${SYSTEM_PROMPT} Hoje é ${new Date().toLocaleDateString('pt-BR', {
+    timeZone: 'America/Sao_Paulo',
+    dateStyle: 'full',
+  })}.`
 
 const MAX_HISTORY = 10
 const history = new Map()
 const lastUse = new Map()
+const allowedList = new Set(ALLOWED_USERS.split(',').map((u) => u.trim()).filter(Boolean))
 
 // ---------- IA ----------
 const NVIDIA_BASE_URL = 'https://integrate.api.nvidia.com/v1'
-const NVIDIA_MODELS_URL = `${NVIDIA_BASE_URL}/models` // catálogo de todos os modelos liberados pela NVIDIA para a chave
+const NVIDIA_MODELS_URL = `${NVIDIA_BASE_URL}/models`
 const NVIDIA_FALLBACK_MODELS = NVIDIA_MODEL.split(',').map((x) => x.trim()).filter(Boolean)
 
 const RETRYABLE_STATUS = new Set([408, 409, 425, 429, 500, 502, 503, 504])
@@ -155,7 +187,6 @@ async function getNvidiaModels(deadline) {
       ? data.data.map((item) => item?.id).filter((id) => typeof id === 'string' && id.trim())
       : []
 
-    // Os modelos indicados no .env vêm primeiro; o restante do catálogo entra depois.
     const models = [...new Set([...NVIDIA_FALLBACK_MODELS, ...discovered])]
     if (!models.length) throw createError('Catálogo da NVIDIA retornou vazio', 502)
 
@@ -188,7 +219,7 @@ async function askOpenAICompat(name, url, key, model, messages, timeoutMs) {
     },
     body: JSON.stringify({
       model,
-      messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...messages],
+      messages: [{ role: 'system', content: buildSystemPrompt() }, ...messages],
       max_tokens: 4096,
     }),
     signal: AbortSignal.timeout(timeoutMs),
@@ -242,13 +273,11 @@ async function askWithRotation({ provider, models, messages, deadline, request }
   let lastError
   let round = 0
 
-  // Continua rodando pelos modelos até algum responder ou o prazo total acabar.
   while (remainingTime(deadline) > 0) {
     round++
     const ordered = rotate(uniqueModels, provider)
     let candidates = ordered.filter((model) => availableNow(provider, model))
 
-    // Se todos estiverem marcados como indisponíveis, tenta novamente em ordem rotativa.
     if (!candidates.length) {
       candidates = ordered
       console.warn(`[IA] todos os modelos de ${provider} estão indisponíveis; iniciando nova rodada`)
@@ -265,7 +294,6 @@ async function askWithRotation({ provider, models, messages, deadline, request }
 
     if (remainingTime(deadline) <= 0) break
 
-    // Pequena pausa antes de revisitar modelos que já falharam.
     const pause = Math.min(2000, remainingTime(deadline))
     console.warn(`[IA] rodada ${round} de ${provider} falhou; nova tentativa em ${pause} ms`)
     await sleep(pause)
@@ -341,183 +369,259 @@ async function askAI(messages) {
   throw lastError || createError(`A IA não respondeu em ${TOTAL_TIMEOUT} ms`, 408)
 }
 
-// ---------- Helpers ----------
-const getText = (m) =>
-  m?.conversation ||
-  m?.extendedTextMessage?.text ||
-  m?.imageMessage?.caption ||
-  m?.videoMessage?.caption ||
-  ''
+// ---------- Pesquisa na Web ----------
+const SEARCH_MODE_NORM = String(SEARCH_MODE).toLowerCase()
+const SEARCH_MAX = Math.min(8, Math.max(1, Math.floor(positiveNumber(SEARCH_MAX_RESULTS, 5))))
+const SEARCH_TIMEOUT = positiveNumber(SEARCH_TIMEOUT_MS, 10000)
+const SEARCH_CACHE = positiveNumber(SEARCH_CACHE_MS, 600000)
+const SEARCH_FETCH = Math.max(0, Math.floor(Number(SEARCH_FETCH_PAGES) || 0))
+const searchCache = new Map()
 
-const digits = (jid = '') => jid.split('@')[0].split(':')[0]
+const BROWSER_UA =
+  'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36'
 
-// ---------- Sessão ----------
-let mongoCol
-let currentSock
+const decodeEntities = (str = '') =>
+  str
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#x27;|&#39;/g, "'")
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
+    .replace(/&amp;/g, '&')
 
-async function getAuth() {
-  if (!MONGODB_URI) return useMultiFileAuthState('./auth')
+const stripTags = (str = '') => decodeEntities(str.replace(/<[^>]*>/g, '')).replace(/\s+/g, ' ').trim()
 
-  if (!mongoCol) {
-    const uri = MONGODB_URI.trim()
-      .replace(/^MONGODB_URI\s*=\s*/, '')
-      .replace(/^["']|["']$/g, '')
+const cut = (str = '', max) => (str.length > max ? `${str.slice(0, max - 1)}…` : str)
 
-    if (!/^mongodb(\+srv)?:\/\//.test(uri)) {
-      console.error(
-        `MONGODB_URI inválida: precisa começar com mongodb+srv:// (o seu começa com "${uri.slice(0, 12)}")`
-      )
-      process.exit(1)
-    }
-
-    const client = new MongoClient(uri)
-    await client.connect()
-    mongoCol = client.db('whatsapp_bot').collection('auth')
-  }
-
-  return useMongoAuthState(mongoCol)
+async function searchSerper(query) {
+  const res = await fetch('https://google.serper.dev/search', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-API-KEY': SERPER_API_KEY },
+    body: JSON.stringify({ q: query, gl: 'br', hl: 'pt-br', num: SEARCH_MAX }),
+    signal: AbortSignal.timeout(SEARCH_TIMEOUT),
+  })
+  if (!res.ok) throw await httpFail('Serper', res)
+  const data = await res.json()
+  return (data?.organic || []).map((r) => ({
+    title: stripTags(r.title),
+    url: r.link,
+    snippet: stripTags(r.snippet),
+  }))
 }
 
-// ---------- Bot ----------
-async function start() {
-  const { state, saveCreds } = await getAuth()
-  const { version } = await fetchLatestBaileysVersion()
+async function searchGoogleCSE(query) {
+  const url = new URL('https://www.googleapis.com/customsearch/v1')
+  url.searchParams.set('key', GOOGLE_API_KEY)
+  url.searchParams.set('cx', GOOGLE_CX)
+  url.searchParams.set('q', query)
+  url.searchParams.set('num', String(Math.min(SEARCH_MAX, 10)))
+  url.searchParams.set('gl', 'br')
+  url.searchParams.set('lr', 'lang_pt')
 
-  const sock = makeWASocket({
-    version,
-    auth: state,
-    logger: pino({ level: 'silent' }),
-    browser: ['Ubuntu', 'Chrome', '22.04.4'],
-    markOnlineOnConnect: false,
-  })
-
-  currentSock = sock
-
-  if (!sock.authState.creds.registered) {
-    if (!PHONE_NUMBER) {
-      console.error('Defina PHONE_NUMBER no .env')
-      process.exit(1)
-    }
-
-    await sleep(3000)
-    const code = await sock.requestPairingCode(PHONE_NUMBER)
-    console.log(`\nCódigo de pareamento: ${code}`)
-    console.log('WhatsApp > Aparelhos conectados > Conectar com número de telefone\n')
-  }
-
-  sock.ev.on('creds.update', saveCreds)
-
-  sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
-    if (connection === 'open') console.log('Bot conectado')
-
-    if (connection === 'close') {
-      const code = lastDisconnect?.error?.output?.statusCode
-
-      if (code === DisconnectReason.loggedOut) {
-        console.log('Sessão encerrada. Limpando sessão salva; reinicie para parear de novo.')
-        mongoCol?.deleteMany({}).catch(() => {})
-      } else {
-        console.log('Conexão caiu, reconectando em 3s...')
-        setTimeout(start, 3000)
-      }
-    }
-  })
-
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return
-
-    for (const msg of messages) {
-      try {
-        if (!msg.message || msg.key.fromMe) continue
-
-        const chatId = msg.key.remoteJid
-        if (!chatId?.endsWith('@g.us')) continue
-
-        const text = getText(msg.message).trim()
-        if (!text) continue
-
-        const botNumber = digits(sock.user?.id)
-        const botLid = digits(sock.user?.lid)
-        const mentioned =
-          msg.message.extendedTextMessage?.contextInfo?.mentionedJid?.some((jid) =>
-            [botNumber, botLid].includes(digits(jid))
-          ) ?? false
-
-        const hasPrefix = text.toLowerCase().startsWith(TRIGGER.toLowerCase())
-        if (!hasPrefix && !mentioned) continue
-
-        let question = text
-          .slice(hasPrefix ? TRIGGER.length : 0)
-          .replace(/@\d+/g, '')
-          .trim()
-
-        const quotedRaw = getText(
-          msg.message.extendedTextMessage?.contextInfo?.quotedMessage
-        ).trim()
-        const quoted = quotedRaw
-          .replace(new RegExp(`^${TRIGGER}\\s*`, 'i'), '')
-          .trim()
-
-        if (quoted) {
-          question = question ? `${question}\n\n(Mensagem citada: ${quoted})` : quoted
-        }
-
-        if (!question) {
-          await sock.sendMessage(
-            chatId,
-            { text: 'Fala aí, o que você quer saber? 😄' },
-            { quoted: msg }
-          )
-          continue
-        }
-
-        const sender = msg.key.participant || chatId
-        const now = Date.now()
-
-        if (now - (lastUse.get(sender) ?? 0) < Number(COOLDOWN) * 1000) {
-          await sock.sendMessage(chatId, { react: { text: '⏳', key: msg.key } })
-          continue
-        }
-
-        lastUse.set(sender, now)
-        await sock.sendPresenceUpdate('composing', chatId)
-
-        const name = msg.pushName || 'Alguém'
-        const chat = history.get(chatId) ?? []
-        chat.push({ role: 'user', content: `${name}: ${question}` })
-
-        let answer
-        try {
-          answer = (await askAI(chat)).trim() || 'Não consegui pensar numa resposta 😅'
-        } catch (error) {
-          chat.pop()
-          console.error('[IA] desistiu da solicitação:', error.message)
-          await sock.sendMessage(
-            chatId,
-            { text: 'A IA tentou os modelos disponíveis, mas demorou demais ou todos falharam 😅 Tente novamente daqui a pouco.' },
-            { quoted: msg }
-          )
-          await sock.sendPresenceUpdate('paused', chatId)
-          continue
-        }
-
-        chat.push({ role: 'assistant', content: answer })
-        history.set(chatId, chat.slice(-MAX_HISTORY))
-
-        await sock.sendMessage(chatId, { text: answer }, { quoted: msg })
-        await sock.sendPresenceUpdate('paused', chatId)
-      } catch (error) {
-        console.error('Erro:', error.message)
-      }
-    }
-  })
+  const res = await fetch(url, { signal: AbortSignal.timeout(SEARCH_TIMEOUT) })
+  if (!res.ok) throw await httpFail('Google CSE', res)
+  const data = await res.json()
+  return (data?.items || []).map((r) => ({
+    title: stripTags(r.title),
+    url: r.link,
+    snippet: stripTags(r.snippet),
+  }))
 }
 
-process.on('SIGTERM', () => {
+async function searchTavily(query) {
+  const res = await fetch('https://api.tavily.com/search', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${TAVILY_API_KEY}` },
+    body: JSON.stringify({ query, max_results: SEARCH_MAX, search_depth: 'basic' }),
+    signal: AbortSignal.timeout(SEARCH_TIMEOUT),
+  })
+  if (!res.ok) throw await httpFail('Tavily', res)
+  const data = await res.json()
+  return (data?.results || []).map((r) => ({
+    title: stripTags(r.title),
+    url: r.url,
+    snippet: stripTags(r.content),
+  }))
+}
+
+async function searchBrave(query) {
+  const url = new URL('https://api.search.brave.com/res/v1/web/search')
+  url.searchParams.set('q', query)
+  url.searchParams.set('count', String(SEARCH_MAX))
+  url.searchParams.set('country', 'BR')
+  url.searchParams.set('search_lang', 'pt')
+
+  const res = await fetch(url, {
+    headers: { Accept: 'application/json', 'X-Subscription-Token': BRAVE_API_KEY },
+    signal: AbortSignal.timeout(SEARCH_TIMEOUT),
+  })
+  if (!res.ok) throw await httpFail('Brave', res)
+  const data = await res.json()
+  return (data?.web?.results || []).map((r) => ({
+    title: stripTags(r.title),
+    url: r.url,
+    snippet: stripTags(r.description),
+  }))
+}
+
+async function searchDuckDuckGo(query) {
+  const res = await fetch('https://html.duckduckgo.com/html/', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'User-Agent': BROWSER_UA,
+      'Accept-Language': 'pt-BR,pt;q=0.9',
+    },
+    body: new URLSearchParams({ q: query, kl: 'br-pt' }),
+    signal: AbortSignal.timeout(SEARCH_TIMEOUT),
+  })
+  if (!res.ok) throw await httpFail('DuckDuckGo', res)
+
+  const html = await res.text()
+  if (html.includes('anomaly-modal')) throw createError('DuckDuckGo pediu captcha', 429)
+
+  const results = []
+  for (const chunk of html.split('class="result__a"').slice(1)) {
+    const href = chunk.match(/href="([^"]+)"/)?.[1]
+    const title = chunk.match(/>([\s\S]*?)<\/a>/)?.[1]
+    const snippet = chunk.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/)?.[1]
+    if (!href || !title) continue
+
+    let target = decodeEntities(href)
+    try {
+      const u = new URL(target.startsWith('//') ? `https:${target}` : target)
+      if (u.hostname.endsWith('duckduckgo.com')) {
+        if (u.pathname.startsWith('/y.js')) continue
+        target = u.searchParams.get('uddg') || ''
+      }
+    } catch {
+      continue
+    }
+    if (!/^https?:\/\//.test(target)) continue
+
+    results.push({ title: stripTags(title), url: target, snippet: stripTags(snippet || '') })
+    if (results.length >= SEARCH_MAX) break
+  }
+  return results
+}
+
+async function searchWikipedia(query) {
+  const url = new URL('https://pt.wikipedia.org/w/api.php')
+  url.searchParams.set('action', 'query')
+  url.searchParams.set('list', 'search')
+  url.searchParams.set('srsearch', query)
+  url.searchParams.set('srlimit', String(SEARCH_MAX))
+  url.searchParams.set('format', 'json')
+  url.searchParams.set('utf8', '1')
+
+  const res = await fetch(url, {
+    headers: { 'User-Agent': 'whatsapp-bot/1.0 (bot de grupo)' },
+    signal: AbortSignal.timeout(SEARCH_TIMEOUT),
+  })
+  if (!res.ok) throw await httpFail('Wikipedia', res)
+  const data = await res.json()
+  return (data?.query?.search || []).map((r) => ({
+    title: stripTags(r.title),
+    url: `https://pt.wikipedia.org/?curid=${r.pageid}`,
+    snippet: stripTags(r.snippet),
+  }))
+}
+
+const searchProviders = [
+  SERPER_API_KEY && ['Google', searchSerper],
+  GOOGLE_API_KEY && GOOGLE_CX && ['Google', searchGoogleCSE],
+  TAVILY_API_KEY && ['Tavily', searchTavily],
+  BRAVE_API_KEY && ['Brave', searchBrave],
+  ['DuckDuckGo', searchDuckDuckGo],
+  ['Wikipedia', searchWikipedia],
+].filter(Boolean)
+
+function safePublicUrl(raw) {
   try {
-    currentSock?.ws?.close()
-  } catch {}
-  process.exit(0)
-})
+    const u = new URL(raw)
+    if (!/^https?:$/.test(u.protocol)) return false
+    const h = u.hostname
+    if (h === 'localhost' || h.endsWith('.local') || h.endsWith('.internal')) return false
+    if (/^(127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|0\.)/.test(h)) return false
+    return true
+  } catch {
+    return false
+  }
+}
 
-setTimeout(start, process.env.RENDER ? 15000 : 0)
+async function fetchPageText(url) {
+  if (!safePublicUrl(url)) return ''
+  const res = await fetch(url, {
+    headers: { 'User-Agent': BROWSER_UA, 'Accept-Language': 'pt-BR,pt;q=0.9' },
+    signal: AbortSignal.timeout(SEARCH_TIMEOUT),
+    redirect: 'follow',
+  })
+  if (!res.ok) return ''
+  if (!/text\/html|text\/plain/i.test(res.headers.get('content-type') || '')) return ''
+
+  const html = (await res.text()).slice(0, 600000)
+  const text = stripTags(
+    html
+      .replace(/<(script|style|noscript|svg|nav|footer|header|form|iframe)[\s\S]*?<\/\1>/gi, ' ')
+      .replace(/<!--[\s\S]*?-->/g, ' ')
+  )
+  return cut(text, 1500)
+}
+
+async function webSearch(query) {
+  const key = query.toLowerCase()
+  const cached = searchCache.get(key)
+  if (cached && cached.expiresAt > Date.now()) return cached.results
+
+  let results = []
+  for (const [name, fn] of searchProviders) {
+    try {
+      results = (await fn(query)).filter((r) => r.url && r.title).slice(0, SEARCH_MAX)
+      if (results.length) {
+        console.log(`[Busca] ${name}: ${results.length} resultados para "${query}"`)
+        results.provider = name
+        break
+      }
+    } catch (error) {
+      console.warn(`[Busca] ${name} falhou:`, error.message)
+    }
+  }
+
+  if (results.length && SEARCH_FETCH > 0) {
+    const pages = await Promise.allSettled(results.slice(0, SEARCH_FETCH).map((r) => fetchPageText(r.url)))
+    pages.forEach((p, i) => {
+      if (p.status === 'fulfilled' && p.value) results[i].extract = p.value
+    })
+  }
+
+  if (results.length) {
+    if (searchCache.size > 100) searchCache.delete(searchCache.keys().next().value)
+    searchCache.set(key, { results, expiresAt: Date.now() + SEARCH_CACHE })
+  }
+  return results
+}
+
+const SEARCH_COMMAND = new RegExp(
+  '^\\s*(?:' +
+    [
+      '\\/web',
+      '\\/pesquisa',
+      'pesquis(?:a|e|ar)',
+      'busque',
+      'busca',
+      'buscar',
+      'procur(?:a|e|ar)',
+      'googl(?:a|e|ar)',
+      'google',
+    ].join('|') +
+    ')(?![\\p{L}\\d])[\\s:,-]*',
+  'iu'
+)
+
+const FRESH_HINTS = new RegExp(
+  '(?<![\\p{L}\\d])(?:' +
+    [
+      'hoje',
+      'agora',
+    

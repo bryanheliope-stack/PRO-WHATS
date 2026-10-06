@@ -1,3 +1,4 @@
+
 import pino from 'pino'
 import http from 'node:http'
 import fs from 'node:fs'
@@ -46,19 +47,19 @@ const {
   MODEL_RETRIES = '1',
   AI_TOTAL_TIMEOUT_MS = '180000',
   NVIDIA_CATALOG_CACHE_MS = '3600000',
-  SEARCH_MODE = 'auto', // auto | always | manual | off
+  SEARCH_MODE = 'auto',
   SEARCH_MAX_RESULTS = '5',
   SEARCH_TIMEOUT_MS = '10000',
   SEARCH_CACHE_MS = '600000',
-  SEARCH_FETCH_PAGES = '1', // quantas páginas do topo ler por inteiro (0 = só snippets)
-  SEARCH_SHOW_REASONING = '1', // 1 = a IA mostra um resumo curto do raciocínio quando pesquisa
-  SERPER_API_KEY, // resultados do Google (serper.dev)
-  GOOGLE_API_KEY, // Google Custom Search (opcional, alternativa ao Serper)
+  SEARCH_FETCH_PAGES = '1',
+  SEARCH_SHOW_REASONING = '1',
+  SERPER_API_KEY,
+  GOOGLE_API_KEY,
   GOOGLE_CX,
   TAVILY_API_KEY,
   BRAVE_API_KEY,
-  ALLOWED_USERS = '', // Números permitidos separados por vírgula (ex: 5511999999999)
-  ONLY_ADMINS = 'true', // 'true' para permitir apenas admins do grupo
+  ALLOWED_USERS = '',
+  ONLY_ADMINS = 'true',
 } = process.env
 
 const SYSTEM_PROMPT =
@@ -606,4 +607,25 @@ const SEARCH_COMMAND = new RegExp(
   '^\\s*(?:' +
     [
       '\\/web',
-      '
+      '\\/pesquisa',
+      'pesquis(?:a|e|ar)',
+      'busque',
+      'busca',
+      'buscar',
+      'procur(?:a|e|ar)',
+      'googl(?:a|e|ar)',
+      'google',
+    ].join('|') +
+    ')(?![\\p{L}\\d])[\\s:,-]*',
+  'iu'
+)
+
+const FRESH_HINTS = new RegExp(
+  '(?<![\\p{L}\\d])(?:' +
+    [
+      'hoje',
+      'agora',
+      'atualmente',
+      'atual',
+      'recentes?',
+ 

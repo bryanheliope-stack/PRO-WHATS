@@ -595,8 +595,13 @@ async function webSearch(query) {
   return results
 }
 
-const SEARCH_COMMAND =
-  /^\s*(?:\/web|\/pesquisa|pesquis(?:a|e|ar)|busque|busca|buscar|procur(?:a|e|ar)|googl(?:a|e|ar)|google)(?![\p{L}\d])[\s:,-]*/iu
-
-const FRESH_HINTS =
-  /(?<![\p{L}\d])(hoje|agora|atualmente|atual|recentes?|últim[oa]s?|not[íi]cias?|
+// Regex montadas por partes (linhas curtas) pra não quebrar se o editor/colagem quebrar linha.
+const SEARCH_COMMAND = new RegExp(
+  '^\\s*(?:' +
+    [
+      '\\/web',
+      '\\/pesquisa',
+      'pesquis(?:a|e|ar)',
+      'busque',
+      'busca',
+      'b

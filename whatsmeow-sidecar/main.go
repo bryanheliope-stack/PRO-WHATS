@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -18,7 +19,6 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
-	_ "github.com/mattn/go-sqlite3"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -26,6 +26,7 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
+	_ "modernc.org/sqlite"
 )
 
 var (
@@ -204,20 +205,35 @@ func main() {
 	if dbURL == "" {
 		dbURL = "file:sessao.db"
 	}
-	dialeto := "sqlite3"
-	if strings.HasPrefix(dbURL, "postgres://") || strings.HasPrefix(dbURL, "postgresql://") {
-		dialeto = "pgx" // WM_DATABASE_URL apontando para Postgres: a sessão sobrevive a deploys
-	} else if !strings.Contains(dbURL, "?") {
-		dbURL += "?_foreign_keys=on&_busy_timeout=10000"
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	dbLog := waLog.Stdout("DB", "WARN", false)
-	container, err := sqlstore.New(ctx, dialeto, dbURL, dbLog)
+	// Postgres (WM_DATABASE_URL) mantém a sessão entre deploys; SQLite fica no disco local.
+	// Abre o banco aqui e entrega ao sqlstore, sem depender do nome do driver.
+	var db *sql.DB
+	var dialeto string
+	var err error
+	if strings.HasPrefix(dbURL, "postgres://") || strings.HasPrefix(dbURL, "postgresql://") {
+		dialeto = "postgres"
+		db, err = sql.Open("pgx", dbURL)
+	} else {
+		dialeto = "sqlite3"
+		if !strings.Contains(dbURL, "?") {
+			dbURL += "?_pragma=foreign_keys(1)&_pragma=busy_timeout(10000)"
+		}
+		db, err = sql.Open("sqlite", dbURL)
+		if err == nil {
+			db.SetMaxOpenConns(1)
+		}
+	}
 	if err != nil {
 		log.Fatalf("banco: %v", err)
+	}
+
+	dbLog := waLog.Stdout("DB", "WARN", false)
+	container := sqlstore.NewWithDB(db, dialeto, dbLog)
+	if err := container.Upgrade(ctx); err != nil {
+		log.Fatalf("banco (migração): %v", err)
 	}
 	device, err := container.GetFirstDevice(ctx)
 	if err != nil {

@@ -9,10 +9,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -37,7 +39,8 @@ var (
 	dbURL   = os.Getenv("WM_DB")
 	port    = envOr("WM_PORT", "8081")
 
-	client *whatsmeow.Client
+	client   *whatsmeow.Client
+	sqliteDB *sql.DB // só preenchido quando a sessão está em SQLite
 
 	mu       sync.Mutex
 	status   = "iniciando"
@@ -133,6 +136,7 @@ func tratarEvento(evt any) {
 			texto = m.GetExtendedTextMessage().GetText()
 		}
 		gif := m.GetVideoMessage().GetGifPlayback()
+		log.Printf("mensagem recebida: fromMe=%v grupo=%v texto=%d caracteres", v.Info.IsFromMe, v.Info.IsGroup, len(texto))
 		if texto == "" && !gif {
 			return
 		}
@@ -238,6 +242,7 @@ func main() {
 		db, err = sql.Open("sqlite", dbURL)
 		if err == nil {
 			db.SetMaxOpenConns(1)
+			sqliteDB = db
 		}
 	}
 	if err != nil {
@@ -271,6 +276,31 @@ func main() {
 		escreverJSON(w, 200, map[string]any{
 			"status": status, "codigo": codigo, "codigoEm": codigoEm, "qr": qr, "pareado": pareado,
 		})
+	})
+	// Cópia consistente do SQLite (VACUUM INTO) para o Node guardar no MongoDB
+	mux.HandleFunc("/backup", func(w http.ResponseWriter, r *http.Request) {
+		if !autorizado(r) {
+			w.WriteHeader(404)
+			return
+		}
+		if sqliteDB == nil {
+			escreverJSON(w, 400, map[string]string{"erro": "backup só existe para SQLite"})
+			return
+		}
+		tmp := filepath.Join(os.TempDir(), fmt.Sprintf("wm-backup-%d.db", time.Now().UnixNano()))
+		defer os.Remove(tmp)
+		if _, err := sqliteDB.ExecContext(r.Context(), "VACUUM INTO '"+tmp+"'"); err != nil {
+			escreverJSON(w, 502, map[string]string{"erro": err.Error()})
+			return
+		}
+		f, err := os.Open(tmp)
+		if err != nil {
+			escreverJSON(w, 502, map[string]string{"erro": err.Error()})
+			return
+		}
+		defer f.Close()
+		w.Header().Set("Content-Type", "application/octet-stream")
+		io.Copy(w, f)
 	})
 	mux.HandleFunc("/send", func(w http.ResponseWriter, r *http.Request) {
 		if !autorizado(r) || r.Method != http.MethodPost {

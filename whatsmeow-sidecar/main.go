@@ -186,14 +186,28 @@ func parear(ctx context.Context) {
 	}
 	// O WhatsApp precisa terminar o handshake antes de aceitar o pedido de código
 	time.Sleep(3 * time.Second)
-	c, err := client.PairPhone(ctx, phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
-	if err != nil {
-		log.Fatalf("PairPhone: %v", err) // o Node reinicia o serviço e tenta de novo
+	for {
+		c, err := client.PairPhone(ctx, phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+		if err == nil {
+			mu.Lock()
+			codigo, codigoEm, status = c, time.Now().UnixMilli(), "aguardando_codigo"
+			mu.Unlock()
+			log.Printf("código de pareamento gerado: %s", c)
+			return
+		}
+		if strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "rate-overlimit") {
+			// O WhatsApp limita pedidos de código por número. Insistir só prolonga o bloqueio: espera bastante.
+			setStatus("limite_whatsapp")
+			log.Printf("WhatsApp limitou os pedidos de código (429). Nova tentativa em 20 min. Use o modo QR para parear agora.")
+			select {
+			case <-time.After(20 * time.Minute):
+				continue
+			case <-ctx.Done():
+				return
+			}
+		}
+		log.Fatalf("PairPhone: %v", err) // outro erro: o Node reinicia o serviço
 	}
-	mu.Lock()
-	codigo, codigoEm, status = c, time.Now().UnixMilli(), "aguardando_codigo"
-	mu.Unlock()
-	log.Printf("código de pareamento gerado: %s", c)
 }
 
 // ---------- HTTP ----------

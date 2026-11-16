@@ -1,0 +1,1540 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>São Gabriel • Gestão de Suprimentos & Inteligência de Compras</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet">
+  <style>
+    body { font-family: 'Inter', system-ui, -apple-system, sans-serif; }
+    .font-mono-num { font-family: 'JetBrains Mono', monospace; font-variant-numeric: tabular-nums; }
+  </style>
+</head>
+<body class="bg-[#F4F6F9] text-slate-900 antialiased selection:bg-amber-200 selection:text-slate-950">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useMemo } = React;
+
+    // ============================================================================
+    // DOMÍNIO: MOTOR DE CUSTO REAL EM CENTAVOS (8 REGRAS DE NEGÓCIO)
+    // ============================================================================
+    const SYSTEM_TODAY = "2026-11-15";
+
+    const formatBRL = (cents) => {
+      const sign = cents < 0 ? "-" : "";
+      const abs = Math.abs(Math.round(cents));
+      const reais = Math.floor(abs / 100);
+      const centavos = String(abs % 100).padStart(2, "0");
+      return `${sign}R$ ${reais.toLocaleString("pt-BR")},${centavos}`;
+    };
+
+    const parseBRLToCents = (raw) => {
+      if (typeof raw === "number") return Math.round(raw * 100);
+      const cleaned = String(raw)
+        .replace(/[^\d,.-]/g, "")
+        .replace(/\.(?=\d{3}(?:,|$))/g, "")
+        .replace(",", ".");
+      const num = parseFloat(cleaned);
+      return Number.isFinite(num) ? Math.round(num * 100) : 0;
+    };
+
+    const normalizeUnit = (unit) => {
+      const u = unit.trim().toLowerCase();
+      if (u === "kg" || u === "quilo" || u === "quilos") return { dimension: "mass", factorToBase: 1000, label: "kg" };
+      if (u === "g" || u === "grama" || u === "gramas") return { dimension: "mass", factorToBase: 1, label: "g" };
+      if (u === "l" || u === "litro" || u === "litros") return { dimension: "volume", factorToBase: 1000, label: "L" };
+      if (u === "ml" || u === "mililitro") return { dimension: "volume", factorToBase: 1, label: "ml" };
+      if (u === "un" || u === "unidade" || u === "unidades" || u === "cx" || u === "fd") return { dimension: "count", factorToBase: 1, label: "un" };
+      return null;
+    };
+
+    const convertUnitAmount = (amount, fromUnit, toUnit) => {
+      const from = normalizeUnit(fromUnit);
+      const to = normalizeUnit(toUnit);
+      if (!from || !to) return null;
+      if (from.dimension !== to.dimension) return null;
+      return (amount * from.factorToBase) / to.factorToBase;
+    };
+
+    const onlyDigits = (phone) => String(phone || "").replace(/\D/g, "");
+
+    const buildWhatsAppHref = (phone, message) => {
+      const digits = onlyDigits(phone);
+      const fullNumber = digits.startsWith("55") ? digits : `55${digits}`;
+      return `https://api.whatsapp.com/send?phone=${fullNumber}&text=${encodeURIComponent(message)}`;
+    };
+
+    const buildPhoneHref = (phone) => {
+      const digits = onlyDigits(phone);
+      return `tel:+55${digits}`;
+    };
+
+    function evaluateOffer({ offer, supplier, product, equivalenceGroup, demandAmount, demandUnit, referenceDate = SYSTEM_TODAY }) {
+      const baseResult = {
+        offerId: offer.id,
+        supplierId: supplier.id,
+        supplierName: supplier.name,
+        supplierCity: supplier.city,
+        supplierPhone: supplier.phone,
+        supplierWhatsapp: supplier.whatsapp,
+        productId: product.id,
+        productName: product.name,
+        brand: product.brand,
+        packDescription: `${product.packQuantity} ${product.packUnit}`,
+        validUntil: offer.validUntil,
+        source: offer.source,
+        eligible: false,
+        exclusionReasons: [],
+        packagesNeeded: 0,
+        deliveredBaseAmount: 0,
+        deliveredDisplayUnit: demandUnit,
+        unitPackPriceCents: offer.unitPriceCents,
+        grossSubtotalCents: 0,
+        discountPercentApplied: 0,
+        discountCents: 0,
+        netProductsCents: 0,
+        freightCents: offer.freightCents,
+        freeFreightApplied: false,
+        totalRealCostCents: 0,
+        effectiveUnitCostCents: 0,
+      };
+
+      if (product.equivalenceGroupId !== equivalenceGroup.id) {
+        baseResult.exclusionReasons.push(`Produto fora do grupo "${equivalenceGroup.name}" (Regra 7: equivalência obrigatória).`);
+      }
+
+      if (offer.validUntil < referenceDate) {
+        baseResult.exclusionReasons.push(`Cotação vencida em ${offer.validUntil.split("-").reverse().join("/")} (Regra 6: bloqueio automático).`);
+      }
+
+      const convertedPackAmount = convertUnitAmount(product.packQuantity, product.packUnit, demandUnit);
+      if (convertedPackAmount === null || convertedPackAmount <= 0) {
+        baseResult.exclusionReasons.push(`Unidades incompatíveis (${product.packUnit} vs. ${demandUnit} — Regra 3: sem comparação entre dimensões distintas).`);
+      }
+
+      if (baseResult.exclusionReasons.length > 0) {
+        return baseResult;
+      }
+
+      // Regra 2: Embalagens fechadas (arredondar sempre para cima)
+      const packagesNeeded = Math.ceil(demandAmount / convertedPackAmount);
+      const deliveredAmountInDemandUnit = packagesNeeded * convertedPackAmount;
+      const grossSubtotalCents = packagesNeeded * offer.unitPriceCents;
+
+      // Regra 5: Desconto por volume
+      let discountPercentApplied = 0;
+      if (Array.isArray(offer.volumeDiscounts)) {
+        for (const tier of offer.volumeDiscounts) {
+          if (packagesNeeded >= tier.minPackages && tier.discountPercent > discountPercentApplied) {
+            discountPercentApplied = tier.discountPercent;
+          }
+        }
+      }
+      const discountCents = Math.round((grossSubtotalCents * discountPercentApplied) / 100);
+      const netProductsCents = grossSubtotalCents - discountCents;
+
+      // Regra 6: Pedido mínimo
+      if (netProductsCents < supplier.minOrderCents) {
+        baseResult.packagesNeeded = packagesNeeded;
+        baseResult.grossSubtotalCents = grossSubtotalCents;
+        baseResult.netProductsCents = netProductsCents;
+        baseResult.exclusionReasons.push(
+          `Pedido líquido (${formatBRL(netProductsCents)}) abaixo do mínimo do fornecedor (${formatBRL(supplier.minOrderCents)} — Regra 6).`
+        );
+        return baseResult;
+      }
+
+      // Regra 4: Frete grátis
+      let freightCents = offer.freightCents;
+      let freeFreightApplied = false;
+      if (supplier.freeFreightMinCents !== null && netProductsCents >= supplier.freeFreightMinCents) {
+        freightCents = 0;
+        freeFreightApplied = true;
+      }
+
+      // Regra 1: Custo real total = produtos + frete - descontos
+      const totalRealCostCents = netProductsCents + freightCents;
+      const effectiveUnitCostCents = Math.round(totalRealCostCents / deliveredAmountInDemandUnit);
+
+      return {
+        ...baseResult,
+        eligible: true,
+        packagesNeeded,
+        deliveredBaseAmount: deliveredAmountInDemandUnit,
+        deliveredDisplayUnit: demandUnit,
+        grossSubtotalCents,
+        discountPercentApplied,
+        discountCents,
+        netProductsCents,
+        freightCents,
+        freeFreightApplied,
+        totalRealCostCents,
+        effectiveUnitCostCents,
+      };
+    }
+
+    function compareGroupOffers({ group, suppliers, products, offers, demandAmount, demandUnit, referenceDate = SYSTEM_TODAY }) {
+      const groupProducts = products.filter((p) => p.equivalenceGroupId === group.id);
+      const productMap = new Map(groupProducts.map((p) => [p.id, p]));
+      const supplierMap = new Map(suppliers.map((s) => [s.id, s]));
+
+      const evaluated = [];
+      for (const offer of offers) {
+        const product = productMap.get(offer.productId);
+        if (!product) continue;
+        const supplier = supplierMap.get(offer.supplierId);
+        if (!supplier) continue;
+
+        evaluated.push(
+          evaluateOffer({
+            offer,
+            supplier,
+            product,
+            equivalenceGroup: group,
+            demandAmount,
+            demandUnit,
+            referenceDate,
+          })
+        );
+      }
+
+      const eligible = evaluated
+        .filter((e) => e.eligible)
+        .sort((a, b) => a.totalRealCostCents - b.totalRealCostCents);
+
+      const excluded = evaluated.filter((e) => !e.eligible);
+      const best = eligible[0] || null;
+      const runnerUp = eligible[1] || null;
+      const savingsVsRunnerUpCents = best && runnerUp ? runnerUp.totalRealCostCents - best.totalRealCostCents : 0;
+
+      return {
+        best,
+        runnerUp,
+        savingsVsRunnerUpCents,
+        eligible,
+        excluded,
+      };
+    }
+
+    // ============================================================================
+    // DADOS INICIAIS (SÃO GABRIEL MASSAS — JAPURÁ, PR + MERCADOS LOCAIS)
+    // ============================================================================
+    const ROLES = {
+      admin: { label: "Administrador", canEditMaster: true, canCreateOffers: true, canApprove: true, badgeColor: "bg-slate-900 text-white" },
+      manager: { label: "Gerente de Compras", canEditMaster: false, canCreateOffers: true, canApprove: true, badgeColor: "bg-amber-600 text-white" },
+      operator: { label: "Operador de Cadastro", canEditMaster: true, canCreateOffers: true, canApprove: false, badgeColor: "bg-blue-700 text-white" },
+      viewer: { label: "Leitura / Auditoria", canEditMaster: false, canCreateOffers: false, canApprove: false, badgeColor: "bg-slate-200 text-slate-800" },
+    };
+
+    const INITIAL_GROUPS = [
+      { id: "grp-farinha", name: "Farinha de Trigo Tipo 1 Especial (Massas)", baseUnit: "kg", category: "Matéria-Prima Seca" },
+      { id: "grp-oleo", name: "Óleo de Soja Refinado", baseUnit: "L", category: "Óleos e Gorduras" },
+      { id: "grp-embalagem", name: "Embalagem Plástica BOPP 500g", baseUnit: "un", category: "Embalagens" },
+    ];
+
+    const INITIAL_SUPPLIERS = [
+      { id: "sup-a", name: "Moinho Paraná Industrial Ltda", cnpj: "12.345.678/0001-90", city: "Maringá - PR", phone: "(44) 3221-8800", whatsapp: "44999128800", contactName: "Carlos Mendes", minOrderCents: 50000, freeFreightMinCents: 150000, leadTimeDays: 2 },
+      { id: "sup-b", name: "Distribuidora Norte Sul Alimentos", cnpj: "98.765.432/0001-10", city: "Cianorte - PR", phone: "(44) 3629-4410", whatsapp: "44998444410", contactName: "Fernanda Lima", minOrderCents: 60000, freeFreightMinCents: 80000, leadTimeDays: 1 },
+      { id: "sup-coamo", name: "Coamo Agroindustrial Cooperativa", cnpj: "75.904.383/0001-21", city: "Campo Mourão - PR", phone: "(44) 3518-3500", whatsapp: "44999553500", contactName: "Roberto Almeida", minOrderCents: 50000, freeFreightMinCents: 120000, leadTimeDays: 2 },
+      { id: "sup-c", name: "Atacadão Regional Cianorte", cnpj: "45.111.222/0001-55", city: "Cianorte - PR", phone: "(44) 3018-9200", whatsapp: "44997189200", contactName: "Juliana Rocha", minOrderCents: 40000, freeFreightMinCents: null, leadTimeDays: 1 },
+      { id: "sup-vip", name: "Supermercado Vip (Japurá)", cnpj: "78.152.139/0001-48", city: "Japurá - PR • Av. Bolívar, 192", phone: "(44) 3635-2500", whatsapp: "44999352500", contactName: "Gerência Loja Vip", minOrderCents: 1500, freeFreightMinCents: 5000, leadTimeDays: 0 },
+      { id: "sup-bompreco", name: "Supermercado O Bom Preço (Japurá)", cnpj: "79.439.873/0001-55", city: "Japurá - PR • Centro", phone: "(44) 3635-1420", whatsapp: "44999351420", contactName: "Balcão O Bom Preço", minOrderCents: 1500, freeFreightMinCents: 6000, leadTimeDays: 0 },
+      { id: "sup-ronqui", name: "Supermercados Ronqui (Japurá)", cnpj: "76.412.890/0001-12", city: "Japurá - PR • Av. Bolívar, 737", phone: "(44) 3635-1939", whatsapp: "44999351939", contactName: "Atendimento Ronqui", minOrderCents: 1500, freeFreightMinCents: 5000, leadTimeDays: 0 },
+      { id: "sup-saojoao", name: "Mercado São João (Japurá)", cnpj: "14.228.910/0001-04", city: "Japurá - PR • R. dos Sutis", phone: "(44) 3635-1810", whatsapp: "44999351810", contactName: "Equipe São João", minOrderCents: 1000, freeFreightMinCents: 4000, leadTimeDays: 0 },
+      { id: "sup-uniao", name: "Supermercado União (Japurá)", cnpj: "78.153.582/0001-33", city: "Japurá - PR • Av. Bolívar, 704", phone: "(44) 3635-1580", whatsapp: "44999351580", contactName: "Atendimento União", minOrderCents: 1500, freeFreightMinCents: 5000, leadTimeDays: 0 },
+      { id: "sup-d", name: "Embalagens Sul Brasil Indústria", cnpj: "33.444.555/0001-77", city: "Londrina - PR", phone: "(43) 3377-1020", whatsapp: "43999771020", contactName: "Marcos Vinicius", minOrderCents: 100000, freeFreightMinCents: 180000, leadTimeDays: 3 },
+    ];
+
+    const INITIAL_PRODUCTS = [
+      { id: "prd-f1", equivalenceGroupId: "grp-farinha", name: "Farinha de Trigo Tipo 1 - Saca 25kg", brand: "Moinho Paraná", packQuantity: 25, packUnit: "kg", sku: "FT-25KG-MP" },
+      { id: "prd-f2", equivalenceGroupId: "grp-farinha", name: "Farinha de Trigo Especial Massas - Saca 25kg", brand: "Norte Sul Gold", packQuantity: 25, packUnit: "kg", sku: "FT-25KG-NS" },
+      { id: "prd-f-infasa-fardo", equivalenceGroupId: "grp-farinha", name: "Farinha de Trigo Infasa - Fardo 10x1kg", brand: "Infasa", packQuantity: 10, packUnit: "kg", sku: "FT-INF-10X1" },
+      { id: "prd-f-infasa-1kg", equivalenceGroupId: "grp-farinha", name: "Farinha de Trigo Infasa - Pacote 1kg", brand: "Infasa", packQuantity: 1, packUnit: "kg", sku: "FT-INF-1KG" },
+      { id: "prd-f-varejo-5kg", equivalenceGroupId: "grp-farinha", name: "Farinha de Trigo Tipo 1 - Pacote 5kg", brand: "Coamo", packQuantity: 5, packUnit: "kg", sku: "FT-COA-5KG" },
+      { id: "prd-f3", equivalenceGroupId: "grp-farinha", name: "Farinha de Trigo - Fardo 10x1kg", brand: "Sulista", packQuantity: 10, packUnit: "kg", sku: "FT-10X1-SL" },
+      { id: "prd-o-coamo-cx", equivalenceGroupId: "grp-oleo", name: "Óleo de Soja Coamo - Caixa 20x900ml (18L)", brand: "Coamo", packQuantity: 18, packUnit: "L", sku: "OL-COA-18L" },
+      { id: "prd-o-coamo-900", equivalenceGroupId: "grp-oleo", name: "Óleo de Soja Coamo - Garrafa Pet 900ml", brand: "Coamo", packQuantity: 900, packUnit: "ml", sku: "OL-COA-900ML" },
+      { id: "prd-o2", equivalenceGroupId: "grp-oleo", name: "Óleo de Soja Refinado - Bombona 20L", brand: "Coamo", packQuantity: 20, packUnit: "L", sku: "OL-20L-CM" },
+      { id: "prd-e1", equivalenceGroupId: "grp-embalagem", name: "Bobina / Saco BOPP Transparente 500g - Milheiro", brand: "SulPack", packQuantity: 1000, packUnit: "un", sku: "EMB-1000-SP" },
+      { id: "prd-e-varejo", equivalenceGroupId: "grp-embalagem", name: "Saco Plástico BOPP 500g - Pacote 100 un", brand: "SulPack", packQuantity: 100, packUnit: "un", sku: "EMB-100-SP" },
+    ];
+
+    const INITIAL_OFFERS = [
+      { id: "off-1", supplierId: "sup-a", productId: "prd-f1", unitPriceCents: 8000, freightCents: 7000, validUntil: "2026-11-30", source: "Tabela Comercial Nov/26", volumeDiscounts: [{ minPackages: 20, discountPercent: 4 }] },
+      { id: "off-2", supplierId: "sup-b", productId: "prd-f2", unitPriceCents: 8300, freightCents: 5500, validUntil: "2026-11-28", source: "Cotação WhatsApp #409", volumeDiscounts: [{ minPackages: 25, discountPercent: 5 }] },
+      { id: "off-infasa-coamo", supplierId: "sup-coamo", productId: "prd-f-infasa-fardo", unitPriceCents: 3390, freightCents: 4500, validUntil: "2026-11-29", source: "Tabela Cooperativa Nov/26", volumeDiscounts: [{ minPackages: 30, discountPercent: 3 }] },
+      { id: "off-vip-f1", supplierId: "sup-vip", productId: "prd-f-infasa-1kg", unitPriceCents: 359, freightCents: 0, validUntil: "2026-11-22", source: "Encarte Supermercado Vip Japurá", volumeDiscounts: [] },
+      { id: "off-bompreco-f5", supplierId: "sup-bompreco", productId: "prd-f-varejo-5kg", unitPriceCents: 1690, freightCents: 0, validUntil: "2026-11-22", source: "Pesquisa Balcão O Bom Preço Japurá", volumeDiscounts: [] },
+      { id: "off-ronqui-f1", supplierId: "sup-ronqui", productId: "prd-f-infasa-1kg", unitPriceCents: 365, freightCents: 0, validUntil: "2026-11-21", source: "Cotação Supermercados Ronqui Japurá", volumeDiscounts: [] },
+      { id: "off-3", supplierId: "sup-c", productId: "prd-f3", unitPriceCents: 3100, freightCents: 4000, validUntil: "2026-11-05", source: "Encarte Quinzenal", volumeDiscounts: [] },
+      { id: "off-oleo-coamo-1", supplierId: "sup-coamo", productId: "prd-o-coamo-cx", unitPriceCents: 11200, freightCents: 6000, validUntil: "2026-11-28", source: "Tabela Coamo Direto", volumeDiscounts: [{ minPackages: 15, discountPercent: 4 }] },
+      { id: "off-oleo-coamo-2", supplierId: "sup-b", productId: "prd-o2", unitPriceCents: 12100, freightCents: 4500, validUntil: "2026-11-27", source: "Cotação Norte Sul", volumeDiscounts: [] },
+      { id: "off-uniao-oleo", supplierId: "sup-uniao", productId: "prd-o-coamo-900", unitPriceCents: 589, freightCents: 0, validUntil: "2026-11-23", source: "Oferta Supermercado União Japurá", volumeDiscounts: [] },
+      { id: "off-saojoao-oleo", supplierId: "sup-saojoao", productId: "prd-o-coamo-900", unitPriceCents: 599, freightCents: 0, validUntil: "2026-11-23", source: "Pesquisa Mercado São João Japurá", volumeDiscounts: [] },
+      { id: "off-6", supplierId: "sup-d", productId: "prd-e1", unitPriceCents: 24500, freightCents: 9500, validUntil: "2026-12-05", source: "Proposta Comercial #88", volumeDiscounts: [{ minPackages: 10, discountPercent: 6 }] },
+      { id: "off-vip-emb", supplierId: "sup-vip", productId: "prd-e-varejo", unitPriceCents: 2890, freightCents: 0, validUntil: "2026-11-25", source: "Reposição Local Vip Japurá", volumeDiscounts: [] },
+    ];
+
+    const INITIAL_PRICE_ALERTS = [
+      { id: "al-1", groupId: "grp-farinha", targetUnitPriceCents: 340, active: true, label: "Farinha de Trigo até R$ 3,40 / kg" },
+      { id: "al-2", groupId: "grp-oleo", targetUnitPriceCents: 635, active: true, label: "Óleo de Soja até R$ 6,35 / L" },
+      { id: "al-3", groupId: "grp-embalagem", targetUnitPriceCents: 25, active: true, label: "Embalagem BOPP até R$ 0,25 / un" },
+    ];
+
+    const INITIAL_NOTIFICATIONS = [
+      {
+        id: "ntf-1",
+        timestamp: "Hoje • 09:42",
+        title: "Meta de Preço Atingida em Japurá!",
+        message: "Supermercado O Bom Preço (Japurá) registrou Farinha Coamo 5kg a R$ 3,38/kg (abaixo do alvo de R$ 3,40/kg).",
+        supplierId: "sup-bompreco",
+        groupId: "grp-farinha",
+        unitPriceCents: 338,
+        read: false,
+      },
+      {
+        id: "ntf-2",
+        timestamp: "Ontem • 16:15",
+        title: "Queda de Preço Detectada",
+        message: "Distribuidora Norte Sul atingiu frete grátis para pedido de 250 kg de Farinha (R$ 3,32/kg efetivo).",
+        supplierId: "sup-b",
+        groupId: "grp-farinha",
+        unitPriceCents: 332,
+        read: false,
+      },
+    ];
+
+    const SAMPLE_NFE_XML = `<?xml version="1.0" encoding="UTF-8"?>
+<nfeProc xmlns="http://www.portalfiscal.inf.br/nfe" versao="4.00">
+  <NFe>
+    <infNFe Id="NFe41261175904383000121550010000481291000481295">
+      <ide><nNF>48129</nNF><dhEmi>2026-11-14T10:30:00-03:00</dhEmi></ide>
+      <emit>
+        <CNPJ>75904383000121</CNPJ>
+        <xNome>COAMO AGROINDUSTRIAL COOPERATIVA</xNome>
+        <enderEmit><xMun>CAMPO MOURAO</xMun><UF>PR</UF><fone>4435183500</fone></enderEmit>
+      </emit>
+      <det nItem="1">
+        <prod>
+          <cProd>FT-25KG-COAMO</cProd>
+          <xProd>FARINHA DE TRIGO ESPECIAL MASSAS SACA 25KG</xProd>
+          <uCom>SC</uCom><qCom>10.0000</qCom><vUnCom>78.50</vUnCom><vProd>785.00</vProd><vFrete>45.00</vFrete>
+        </prod>
+      </det>
+    </infNFe>
+  </NFe>
+</nfeProc>`;
+
+    const MARKET_CATALOG = [
+      { id: "jp-vip-1", scope: "japura", channel: "Supermercado Vip • Japurá/PR", region: "Av. Bolívar, 192 • Japurá - PR", transitDays: 0, title: "Farinha de Trigo Infasa Tipo 1 - Pacote 1kg", brand: "Infasa", packQty: 1, packUnit: "kg", priceCents: 345, freightCents: 0, minOrderCents: 1500, phone: "(44) 3635-2500", whatsapp: "44999352500", supplierId: "sup-vip", updated: "Hoje • Encarte Loja" },
+      { id: "jp-bompreco-1", scope: "japura", channel: "Supermercado O Bom Preço • Japurá/PR", region: "Centro • Japurá - PR", transitDays: 0, title: "Farinha de Trigo Coamo Especial - Pacote 5kg", brand: "Coamo", packQty: 5, packUnit: "kg", priceCents: 1640, freightCents: 0, minOrderCents: 1500, phone: "(44) 3635-1420", whatsapp: "44999351420", supplierId: "sup-bompreco", updated: "Hoje • Balcão" },
+      { id: "jp-ronqui-1", scope: "japura", channel: "Supermercados Ronqui • Japurá/PR", region: "Av. Bolívar, 737 • Japurá - PR", transitDays: 0, title: "Farinha de Trigo Tipo 1 - Fardo 10x1kg", brand: "Infasa", packQty: 10, packUnit: "kg", priceCents: 3320, freightCents: 0, minOrderCents: 1500, phone: "(44) 3635-1939", whatsapp: "44999351939", supplierId: "sup-ronqui", updated: "Hoje • Oferta Local" },
+      { id: "jp-saojoao-1", scope: "japura", channel: "Mercado São João • Japurá/PR", region: "R. dos Sutis • Japurá - PR", transitDays: 0, title: "Óleo de Soja Coamo Refinado - Garrafa 900ml", brand: "Coamo", packQty: 900, packUnit: "ml", priceCents: 569, freightCents: 0, minOrderCents: 1000, phone: "(44) 3635-1810", whatsapp: "44999351810", supplierId: "sup-saojoao", updated: "Hoje • Balcão" },
+      { id: "jp-uniao-1", scope: "japura", channel: "Supermercado União • Japurá/PR", region: "Av. Bolívar, 704 • Japurá - PR", transitDays: 0, title: "Óleo de Soja Coamo - Caixa Fechada 20x900ml (18L)", brand: "Coamo", packQty: 18, packUnit: "L", priceCents: 11180, freightCents: 0, minOrderCents: 1500, phone: "(44) 3635-1580", whatsapp: "44999351580", supplierId: "sup-uniao", updated: "Hoje • Atacado Loja" },
+      { id: "jp-vip-2", scope: "japura", channel: "Supermercado Vip • Japurá/PR", region: "Av. Bolívar, 192 • Japurá - PR", transitDays: 0, title: "Óleo de Soja Coamo - Garrafa 900ml", brand: "Coamo", packQty: 900, packUnit: "ml", priceCents: 575, freightCents: 0, minOrderCents: 1500, phone: "(44) 3635-2500", whatsapp: "44999352500", supplierId: "sup-vip", updated: "Hoje • Encarte Loja" },
+      { id: "pr-1", scope: "pr", channel: "Menor Preço Paraná (Nota Paraná)", region: "Cianorte / Maringá - PR", transitDays: 0, title: "Farinha de Trigo Infasa Tipo 1 - Fardo 10x1kg", brand: "Infasa", packQty: 10, packUnit: "kg", priceCents: 3190, freightCents: 0, minOrderCents: 3190, phone: "(44) 3629-1100", whatsapp: "44999111100", supplierId: null, updated: "NFC-e há 25 min" },
+      { id: "pr-2", scope: "pr", channel: "Assaí Atacadista", region: "Maringá - PR (48 km)", transitDays: 1, title: "Farinha de Trigo Tipo 1 Especial - Saca 25kg", brand: "Moinho Paraná", packQty: 25, packUnit: "kg", priceCents: 7690, freightCents: 4500, minOrderCents: 15000, phone: "(44) 3218-7000", whatsapp: "44999187000", supplierId: null, updated: "Hoje • Televendas" },
+      { id: "pr-3", scope: "pr", channel: "Atacadão S.A.", region: "Maringá - PR (48 km)", transitDays: 1, title: "Óleo de Soja Coamo - Caixa 20x900ml (18L)", brand: "Coamo", packQty: 18, packUnit: "L", priceCents: 10980, freightCents: 5000, minOrderCents: 20000, phone: "(44) 3261-4500", whatsapp: "44999614500", supplierId: null, updated: "Hoje • Cotação B2B" },
+      { id: "pr-4", scope: "pr", channel: "Max Atacadista (Grupo Muffato)", region: "Cianorte - PR (22 km)", transitDays: 1, title: "Óleo de Soja Coamo - Garrafa Pet 900ml (Unidade)", brand: "Coamo", packQty: 900, packUnit: "ml", priceCents: 559, freightCents: 2500, minOrderCents: 5000, phone: "(44) 3619-3300", whatsapp: "44999193300", supplierId: null, updated: "Hoje • Loja Cianorte" },
+      { id: "br-1", scope: "br", channel: "Moinho Sul & Grãos (Distribuição Nacional)", region: "Ponta Grossa - PR → Japurá - PR", transitDays: 2, title: "Farinha de Trigo Industrial Pastifício - Saca 25kg", brand: "SulGrãos", packQty: 25, packUnit: "kg", priceCents: 7450, freightCents: 6500, minOrderCents: 30000, phone: "(42) 3220-9100", whatsapp: "42999209100", supplierId: null, updated: "Tabela Nacional" },
+      { id: "br-2", scope: "br", channel: "Central Atacado SP / Interior", region: "Ribeirão Preto - SP → Japurá - PR", transitDays: 4, title: "Bobina / Saco Plástico BOPP 500g - Milheiro", brand: "PackBrasil", packQty: 1000, packUnit: "un", priceCents: 21800, freightCents: 8900, minOrderCents: 40000, phone: "(16) 3512-4400", whatsapp: "16999124400", supplierId: null, updated: "Tabela Nacional" },
+      { id: "br-3", scope: "br", channel: "Cooperativa AgroIndustrial Sul", region: "Chapecó - SC → Japurá - PR", transitDays: 3, title: "Óleo de Soja Refinado Industrial - Bombona 20L", brand: "AgroSul", packQty: 20, packUnit: "L", priceCents: 11400, freightCents: 7500, minOrderCents: 35000, phone: "(49) 3321-7800", whatsapp: "49999217800", supplierId: null, updated: "Tabela Nacional" },
+    ];
+
+    function App() {
+      const [activeTab, setActiveTab] = useState("compare");
+      const [roleKey, setRoleKey] = useState("manager");
+      const role = ROLES[roleKey];
+
+      const [groups] = useState(INITIAL_GROUPS);
+      const [suppliers, setSuppliers] = useState(INITIAL_SUPPLIERS);
+      const [products, setProducts] = useState(INITIAL_PRODUCTS);
+      const [offers, setOffers] = useState(INITIAL_OFFERS);
+
+      const [priceAlerts, setPriceAlerts] = useState(INITIAL_PRICE_ALERTS);
+      const [notifications, setNotifications] = useState(INITIAL_NOTIFICATIONS);
+      const [showNotificationDrawer, setShowNotificationDrawer] = useState(false);
+      const [browserNotifPermission, setBrowserNotifPermission] = useState(
+        typeof Notification !== "undefined" ? Notification.permission : "unsupported"
+      );
+
+      const [selectedGroupId, setSelectedGroupId] = useState("grp-farinha");
+      const [demandAmountInput, setDemandAmountInput] = useState("250");
+      const [demandUnitInput, setDemandUnitInput] = useState("kg");
+
+      const [marketQuery, setMarketQuery] = useState("");
+      const [marketScope, setMarketScope] = useState("all");
+      const [targetGroupForImport, setTargetGroupForImport] = useState("grp-farinha");
+
+      const [newSupplierName, setNewSupplierName] = useState("");
+      const [newSupplierCity, setNewSupplierCity] = useState("Japurá - PR");
+      const [newSupplierPhone, setNewSupplierPhone] = useState("");
+      const [newSupplierWhatsapp, setNewSupplierWhatsapp] = useState("");
+      const [newSupplierMinOrder, setNewSupplierMinOrder] = useState("50,00");
+      const [newSupplierFreeFreight, setNewSupplierFreeFreight] = useState("150,00");
+
+      const [newOfferSupplierId, setNewOfferSupplierId] = useState("sup-vip");
+      const [newOfferProductId, setNewOfferProductId] = useState("prd-f-infasa-1kg");
+      const [newOfferPrice, setNewOfferPrice] = useState("3,35");
+      const [newOfferFreight, setNewOfferFreight] = useState("0,00");
+      const [newOfferValidUntil, setNewOfferValidUntil] = useState("2026-11-30");
+
+      const [newAlertGroupId, setNewAlertGroupId] = useState("grp-farinha");
+      const [newAlertTargetPrice, setNewAlertTargetPrice] = useState("3,35");
+
+      const [xmlText, setXmlText] = useState("");
+      const [parsedXmlPreview, setParsedXmlPreview] = useState(null);
+
+      const [toast, setToast] = useState(null);
+      const showToast = (msg, type = "success") => {
+        setToast({ msg, type });
+        setTimeout(() => setToast(null), 5000);
+      };
+
+      const requestBrowserNotification = async () => {
+        if (typeof Notification === "undefined") {
+          showToast("Seu navegador não suporta notificações nativas; os alertas internos continuam ativos.", "info");
+          return;
+        }
+        const perm = await Notification.requestPermission();
+        setBrowserNotifPermission(perm);
+        if (perm === "granted") {
+          showToast("Notificações do navegador ativadas com sucesso!");
+          new Notification("São Gabriel Compras Inteligentes", {
+            body: "Monitoramento de preços em Japurá e região ativado.",
+          });
+        }
+      };
+
+      const checkPriceAlertTrigger = ({ product, supplier, unitPriceCents, sourceLabel }) => {
+        const convertedBase = convertUnitAmount(product.packQuantity, product.packUnit, groups.find((g) => g.id === product.equivalenceGroupId)?.baseUnit || product.packUnit);
+        if (!convertedBase || convertedBase <= 0) return;
+        const unitEffectiveCents = Math.round(unitPriceCents / convertedBase);
+
+        const matchingAlert = priceAlerts.find(
+          (al) => al.active && al.groupId === product.equivalenceGroupId && unitEffectiveCents <= al.targetUnitPriceCents
+        );
+
+        if (matchingAlert) {
+          const group = groups.find((g) => g.id === product.equivalenceGroupId);
+          const newNotif = {
+            id: `ntf-${Date.now()}`,
+            timestamp: "Agora mesmo",
+            title: `Alerta de Preço Baixo: ${product.brand}`,
+            message: `${supplier.name} ofereceu ${product.name} a ${formatBRL(unitEffectiveCents)}/${group?.baseUnit || product.packUnit} (abaixo da meta de ${formatBRL(matchingAlert.targetUnitPriceCents)}) via ${sourceLabel}.`,
+            supplierId: supplier.id,
+            groupId: product.equivalenceGroupId,
+            unitPriceCents: unitEffectiveCents,
+            read: false,
+          };
+          setNotifications((prev) => [newNotif, ...prev]);
+          showToast(`ALERTA DE PREÇO: ${supplier.name} está abaixo da meta (${formatBRL(unitEffectiveCents)}/${group?.baseUnit})!`, "alert");
+
+          if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+            new Notification(newNotif.title, { body: newNotif.message });
+          }
+        }
+      };
+
+      const selectedGroup = groups.find((g) => g.id === selectedGroupId) || groups[0];
+
+      const handleSelectGroup = (gid) => {
+        setSelectedGroupId(gid);
+        const grp = groups.find((g) => g.id === gid);
+        if (grp) {
+          setDemandUnitInput(grp.baseUnit);
+          if (grp.baseUnit === "kg") setDemandAmountInput("250");
+          if (grp.baseUnit === "L") setDemandAmountInput("180");
+          if (grp.baseUnit === "un") setDemandAmountInput("5000");
+        }
+      };
+
+      const comparisonResult = useMemo(() => {
+        const numericDemand = parseFloat(String(demandAmountInput).replace(",", ".")) || 1;
+        return compareGroupOffers({
+          group: selectedGroup,
+          suppliers,
+          products,
+          offers,
+          demandAmount: numericDemand,
+          demandUnit: demandUnitInput,
+          referenceDate: SYSTEM_TODAY,
+        });
+      }, [selectedGroup, suppliers, products, offers, demandAmountInput, demandUnitInput]);
+
+      const filteredMarketItems = useMemo(() => {
+        const q = marketQuery.trim().toLowerCase();
+        return MARKET_CATALOG.filter((item) => {
+          const matchesScope = marketScope === "all" || item.scope === marketScope;
+          const matchesQuery =
+            !q ||
+            item.title.toLowerCase().includes(q) ||
+            item.channel.toLowerCase().includes(q) ||
+            item.brand.toLowerCase().includes(q) ||
+            item.region.toLowerCase().includes(q);
+          return matchesScope && matchesQuery;
+        });
+      }, [marketQuery, marketScope]);
+
+      const handleImportMarketOffer = (item) => {
+        const targetGroup = groups.find((g) => g.id === targetGroupForImport) || selectedGroup;
+
+        let supplierObj = item.supplierId ? suppliers.find((s) => s.id === item.supplierId) : null;
+        if (!supplierObj) {
+          const existingByName = suppliers.find((s) => s.name.toLowerCase() === item.channel.toLowerCase());
+          if (existingByName) {
+            supplierObj = existingByName;
+          } else {
+            supplierObj = {
+              id: `sup-mkt-${Date.now()}`,
+              name: item.channel,
+              cnpj: "Cotação Externa",
+              city: item.region,
+              phone: item.phone,
+              whatsapp: item.whatsapp,
+              contactName: "Comercial / Televendas",
+              minOrderCents: item.minOrderCents || 0,
+              freeFreightMinCents: null,
+              leadTimeDays: item.transitDays,
+            };
+            setSuppliers((prev) => [...prev, supplierObj]);
+          }
+        }
+
+        const compatibleCheck = convertUnitAmount(item.packQty, item.packUnit, targetGroup.baseUnit);
+        const effectivePackQty = compatibleCheck !== null ? item.packQty : 1;
+        const effectivePackUnit = compatibleCheck !== null ? item.packUnit : targetGroup.baseUnit;
+
+        const newProduct = {
+          id: `prd-mkt-${Date.now()}`,
+          equivalenceGroupId: targetGroup.id,
+          name: item.title,
+          brand: item.brand,
+          packQuantity: effectivePackQty,
+          packUnit: effectivePackUnit,
+          sku: `MKT-${Math.floor(1000 + Math.random() * 9000)}`,
+        };
+        setProducts((prev) => [...prev, newProduct]);
+
+        const newOffer = {
+          id: `off-mkt-${Date.now()}`,
+          supplierId: supplierObj.id,
+          productId: newProduct.id,
+          unitPriceCents: item.priceCents,
+          freightCents: item.freightCents,
+          validUntil: "2026-11-30",
+          source: item.channel,
+          volumeDiscounts: [],
+        };
+        setOffers((prev) => [newOffer, ...prev]);
+
+        checkPriceAlertTrigger({
+          product: newProduct,
+          supplier: supplierObj,
+          unitPriceCents: item.priceCents,
+          sourceLabel: item.channel,
+        });
+
+        setSelectedGroupId(targetGroup.id);
+        setDemandUnitInput(targetGroup.baseUnit);
+        setActiveTab("compare");
+        showToast(`Cotação "${item.channel}" adicionada ao Comparador de Custo Real.`);
+      };
+
+      const handleAddSupplier = (e) => {
+        e.preventDefault();
+        if (!role.canEditMaster) return;
+        if (!newSupplierName.trim()) return;
+        const created = {
+          id: `sup-${Date.now()}`,
+          name: newSupplierName.trim(),
+          cnpj: "Novo Cadastro",
+          city: newSupplierCity.trim() || "Japurá - PR",
+          phone: newSupplierPhone.trim() || "(44) 3635-0000",
+          whatsapp: onlyDigits(newSupplierWhatsapp || newSupplierPhone) || "44999990000",
+          contactName: "Comercial",
+          minOrderCents: parseBRLToCents(newSupplierMinOrder),
+          freeFreightMinCents: newSupplierFreeFreight.trim() ? parseBRLToCents(newSupplierFreeFreight) : null,
+          leadTimeDays: 1,
+        };
+        setSuppliers((prev) => [...prev, created]);
+        setNewSupplierName("");
+        setNewSupplierPhone("");
+        setNewSupplierWhatsapp("");
+        showToast(`Fornecedor "${created.name}" cadastrado com sucesso.`);
+      };
+
+      const handleAddOffer = (e) => {
+        e.preventDefault();
+        if (!role.canCreateOffers) return;
+        const supplierObj = suppliers.find((s) => s.id === newOfferSupplierId);
+        const productObj = products.find((p) => p.id === newOfferProductId);
+        if (!supplierObj || !productObj) return;
+
+        const priceCents = parseBRLToCents(newOfferPrice);
+        const freightCents = parseBRLToCents(newOfferFreight);
+
+        const created = {
+          id: `off-${Date.now()}`,
+          supplierId: supplierObj.id,
+          productId: productObj.id,
+          unitPriceCents: priceCents,
+          freightCents,
+          validUntil: newOfferValidUntil || "2026-11-30",
+          source: "Lançamento Manual",
+          volumeDiscounts: [],
+        };
+        setOffers((prev) => [created, ...prev]);
+
+        checkPriceAlertTrigger({
+          product: productObj,
+          supplier: supplierObj,
+          unitPriceCents: priceCents,
+          sourceLabel: "Lançamento Manual",
+        });
+
+        setSelectedGroupId(productObj.equivalenceGroupId);
+        setActiveTab("compare");
+        showToast("Nova cotação registrada e avaliada pelo motor de custo.");
+      };
+
+      const handleCreateAlert = (e) => {
+        e.preventDefault();
+        const grp = groups.find((g) => g.id === newAlertGroupId);
+        const targetCents = parseBRLToCents(newAlertTargetPrice);
+        if (!grp || targetCents <= 0) return;
+
+        const created = {
+          id: `al-${Date.now()}`,
+          groupId: grp.id,
+          targetUnitPriceCents: targetCents,
+          active: true,
+          label: `${grp.name.split("(")[0].trim()} até ${formatBRL(targetCents)} / ${grp.baseUnit}`,
+        };
+        setPriceAlerts((prev) => [created, ...prev]);
+        showToast(`Alerta ativado: você será notificado quando houver oferta ≤ ${formatBRL(targetCents)}/${grp.baseUnit}.`);
+      };
+
+      const handleParseXml = (rawXml) => {
+        try {
+          const parser = new DOMParser();
+          const doc = parser.parseFromString(rawXml, "text/xml");
+          const xNome = doc.querySelector("emit > xNome")?.textContent || "Fornecedor NF-e";
+          const fone = doc.querySelector("emit > enderEmit > fone")?.textContent || "4435183500";
+          const xProd = doc.querySelector("det > prod > xProd")?.textContent || "Produto NF-e";
+          const vUnCom = doc.querySelector("det > prod > vUnCom")?.textContent || "0";
+          const vFrete = doc.querySelector("det > prod > vFrete")?.textContent || "0";
+          const nNF = doc.querySelector("ide > nNF")?.textContent || "0000";
+
+          setParsedXmlPreview({
+            supplierName: xNome,
+            phone: fone,
+            productName: xProd,
+            unitPriceCents: parseBRLToCents(vUnCom),
+            freightCents: parseBRLToCents(vFrete),
+            nfeNumber: nNF,
+          });
+        } catch (err) {
+          showToast("Não foi possível ler o arquivo XML informado.", "error");
+        }
+      };
+
+      const handleImportParsedXml = () => {
+        if (!parsedXmlPreview) return;
+        let sup = suppliers.find((s) => s.name.toLowerCase().includes("coamo")) || suppliers[0];
+        const newProd = {
+          id: `prd-xml-${Date.now()}`,
+          equivalenceGroupId: "grp-farinha",
+          name: `${parsedXmlPreview.productName} (NF-e #${parsedXmlPreview.nfeNumber})`,
+          brand: "Coamo",
+          packQuantity: 25,
+          packUnit: "kg",
+          sku: `NFE-${parsedXmlPreview.nfeNumber}`,
+        };
+        setProducts((prev) => [...prev, newProd]);
+
+        const newOff = {
+          id: `off-xml-${Date.now()}`,
+          supplierId: sup.id,
+          productId: newProd.id,
+          unitPriceCents: parsedXmlPreview.unitPriceCents,
+          freightCents: parsedXmlPreview.freightCents,
+          validUntil: "2026-12-10",
+          source: `XML NF-e #${parsedXmlPreview.nfeNumber}`,
+          volumeDiscounts: [],
+        };
+        setOffers((prev) => [newOff, ...prev]);
+
+        checkPriceAlertTrigger({
+          product: newProd,
+          supplier: sup,
+          unitPriceCents: parsedXmlPreview.unitPriceCents,
+          sourceLabel: `XML NF-e #${parsedXmlPreview.nfeNumber}`,
+        });
+
+        setSelectedGroupId("grp-farinha");
+        setDemandUnitInput("kg");
+        setActiveTab("compare");
+        showToast(`NF-e #${parsedXmlPreview.nfeNumber} importada para o Comparador!`);
+      };
+
+      const unreadCount = notifications.filter((n) => !n.read).length;
+
+      return (
+        <div className="min-h-screen flex flex-col">
+          {toast && (
+            <div className={`fixed bottom-5 right-5 z-50 max-w-md px-5 py-3.5 rounded-lg shadow-xl border text-sm font-medium flex items-center gap-3 ${
+              toast.type === "alert"
+                ? "bg-amber-600 text-white border-amber-500"
+                : "bg-slate-900 text-white border-slate-700"
+            }`}>
+              <span className="h-2.5 w-2.5 rounded-full bg-emerald-400 shrink-0 animate-pulse"></span>
+              <span>{toast.msg}</span>
+            </div>
+          )}
+
+          <header className="bg-[#0F172A] text-white border-b border-slate-800 sticky top-0 z-30">
+            <div className="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-4">
+              <div className="flex items-center gap-3">
+                <div className="h-9 w-9 rounded bg-amber-500 text-slate-950 font-extrabold flex items-center justify-center text-base tracking-tight shadow-sm">
+                  SG
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="font-bold text-sm sm:text-base tracking-tight">SÃO GABRIEL MASSAS</span>
+                    <span className="hidden md:inline-block text-[11px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded bg-slate-800 text-amber-400 border border-slate-700">
+                      Suprimentos & Cotações
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-slate-400">Unidade Fabril • Japurá, Paraná • Motor de Custo Real em Centavos</p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-3">
+                <div className="relative">
+                  <button
+                    onClick={() => {
+                      setShowNotificationDrawer(!showNotificationDrawer);
+                      setNotifications((prev) => prev.map((n) => ({ ...n, read: true })));
+                    }}
+                    className="relative p-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 transition"
+                    title="Notificações de Queda de Preço"
+                  >
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
+                    </svg>
+                    {unreadCount > 0 && (
+                      <span className="absolute -top-1.5 -right-1.5 h-5 min-w-[20px] px-1 rounded-full bg-rose-600 text-white text-[11px] font-bold flex items-center justify-center">
+                        {unreadCount}
+                      </span>
+                    )}
+                  </button>
+
+                  {showNotificationDrawer && (
+                    <div className="absolute right-0 mt-2 w-96 bg-white text-slate-900 rounded-xl shadow-2xl border border-slate-200 z-50 overflow-hidden">
+                      <div className="px-4 py-3 bg-slate-900 text-white flex items-center justify-between">
+                        <span className="text-xs font-bold uppercase tracking-wider">Alertas de Preço Disparados</span>
+                        <button onClick={() => setShowNotificationDrawer(false)} className="text-xs text-slate-400 hover:text-white">Fechar</button>
+                      </div>
+                      <div className="max-h-80 overflow-y-auto divide-y divide-slate-100">
+                        {notifications.map((n) => {
+                          const sup = suppliers.find((s) => s.id === n.supplierId);
+                          return (
+                            <div key={n.id} className="p-3.5 hover:bg-slate-50">
+                              <div className="flex items-center justify-between text-[11px] text-slate-500 mb-1">
+                                <span className="font-bold text-emerald-700">{n.title}</span>
+                                <span>{n.timestamp}</span>
+                              </div>
+                              <p className="text-xs text-slate-700 leading-relaxed">{n.message}</p>
+                              {sup && (
+                                <div className="mt-2 flex items-center gap-2">
+                                  <a
+                                    href={buildWhatsAppHref(sup.whatsapp, `Olá ${sup.contactName}, vi a oferta registrada para a São Gabriel Massas e gostaria de reservar o lote.`)}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="text-[11px] font-semibold px-2.5 py-1 rounded bg-emerald-600 text-white hover:bg-emerald-700"
+                                  >
+                                    WhatsApp: {sup.phone}
+                                  </a>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                <div className="flex items-center gap-2 bg-slate-800/90 border border-slate-700 rounded-lg px-2.5 py-1.5">
+                  <span className="text-[11px] text-slate-400 hidden sm:inline">Perfil:</span>
+                  <select
+                    value={roleKey}
+                    onChange={(e) => setRoleKey(e.target.value)}
+                    className="bg-transparent text-xs font-semibold text-white focus:outline-none cursor-pointer"
+                  >
+                    {Object.entries(ROLES).map(([k, v]) => (
+                      <option key={k} value={k} className="text-slate-900">{v.label}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+            </div>
+
+            <nav className="bg-slate-900/95 border-t border-slate-800">
+              <div className="max-w-7xl mx-auto px-4 sm:px-6 flex items-center gap-1 overflow-x-auto py-1.5">
+                {[
+                  { id: "compare", label: "Comparador de Custo Real" },
+                  { id: "market", label: "Pesquisa Japurá, PR & Brasil" },
+                  { id: "alerts", label: `Alertas de Preço (${priceAlerts.filter((a) => a.active).length})` },
+                  { id: "suppliers", label: `Fornecedores & Mercados (${suppliers.length})` },
+                  { id: "offers", label: "Lançar Cotação" },
+                  { id: "xml", label: "Importar XML NF-e" },
+                ].map((tab) => (
+                  <button
+                    key={tab.id}
+                    onClick={() => setActiveTab(tab.id)}
+                    className={`px-3.5 py-2 rounded-md text-xs font-semibold whitespace-nowrap transition ${
+                      activeTab === tab.id
+                        ? "bg-amber-500 text-slate-950 shadow-sm"
+                        : "text-slate-300 hover:text-white hover:bg-slate-800"
+                    }`}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+            </nav>
+          </header>
+
+          <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-6">
+            {activeTab === "compare" && (
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                <div className="lg:col-span-8 space-y-5">
+                  <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+                    <div className="flex flex-wrap items-center justify-between gap-2 pb-4 mb-4 border-b border-slate-100">
+                      <div>
+                        <h1 className="text-base font-bold text-slate-900">Análise Comparativa de Custo Real Total</h1>
+                        <p className="text-xs text-slate-500">Cálculo exato em centavos: produtos + frete − descontos por volume, com arredondamento de embalagem fechada.</p>
+                      </div>
+                      <span className="text-[11px] font-mono-num px-2.5 py-1 rounded bg-slate-100 text-slate-700 border border-slate-200">
+                        Data Base: 15/11/2026
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-12 gap-4">
+                      <div className="sm:col-span-6">
+                        <label className="block text-xs font-semibold text-slate-700 mb-1">Grupo de Equivalência Aprovado</label>
+                        <select
+                          value={selectedGroupId}
+                          onChange={(e) => handleSelectGroup(e.target.value)}
+                          className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium bg-white focus:outline-none focus:ring-2 focus:ring-amber-500"
+                        >
+                          {groups.map((g) => (
+                            <option key={g.id} value={g.id}>{g.name}</option>
+                          ))}
+                        </select>
+                      </div>
+
+                      <div className="sm:col-span-3">
+                        <label className="block text-xs font-semibold text-slate-700 mb-1">Demanda do Pedido</label>
+                        <input
+                          type="number"
+                          min="1"
+                          step="any"
+                          value={demandAmountInput}
+                          onChange={(e) => setDemandAmountInput(e.target.value)}
+                          className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono-num font-semibold focus:outline-none focus:ring-2 focus:ring-amber-500"
+                        />
+                      </div>
+
+                      <div className="sm:col-span-3">
+                        <label className="block text-xs font-semibold text-slate-700 mb-1">Unidade</label>
+                        <select
+                          value={demandUnitInput}
+                          onChange={(e) => setDemandUnitInput(e.target.value)}
+                          className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium bg-white focus:outline-none focus:ring-2 focus:ring-amber-500"
+                        >
+                          <option value="kg">Quilos (kg)</option>
+                          <option value="L">Litros (L)</option>
+                          <option value="un">Unidades (un)</option>
+                        </select>
+                      </div>
+                    </div>
+                  </div>
+
+                  {comparisonResult.best ? (
+                    <div className="bg-emerald-950 text-white rounded-xl p-5 shadow-md border border-emerald-800">
+                      <div className="flex flex-wrap items-start justify-between gap-4">
+                        <div>
+                          <div className="flex items-center gap-2 mb-1">
+                            <span className="px-2 py-0.5 rounded text-[11px] font-bold uppercase tracking-wider bg-emerald-500 text-slate-950">
+                              Melhor Custo Real
+                            </span>
+                            <span className="text-xs text-emerald-300">{comparisonResult.best.supplierCity}</span>
+                          </div>
+                          <h2 className="text-lg font-bold">{comparisonResult.best.supplierName}</h2>
+                          <p className="text-xs text-emerald-200 mt-0.5">
+                            {comparisonResult.best.productName} • {comparisonResult.best.packagesNeeded} emb. ({comparisonResult.best.deliveredBaseAmount} {comparisonResult.best.deliveredDisplayUnit})
+                          </p>
+                        </div>
+
+                        <div className="text-right">
+                          <div className="text-xs text-emerald-300">Custo Real Total</div>
+                          <div className="text-2xl font-extrabold font-mono-num text-white">
+                            {formatBRL(comparisonResult.best.totalRealCostCents)}
+                          </div>
+                          <div className="text-xs font-mono-num text-emerald-300">
+                            {formatBRL(comparisonResult.best.effectiveUnitCostCents)} / {comparisonResult.best.deliveredDisplayUnit}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="mt-4 pt-3.5 border-t border-emerald-800/80 flex flex-wrap items-center justify-between gap-3">
+                        <div className="text-xs text-emerald-200">
+                          {comparisonResult.savingsVsRunnerUpCents > 0 ? (
+                            <span>
+                              Economia real de <strong className="text-white font-mono-num">{formatBRL(comparisonResult.savingsVsRunnerUpCents)}</strong> em relação ao 2º colocado ({comparisonResult.runnerUp.supplierName}).
+                            </span>
+                          ) : (
+                            <span>Única oferta elegível dentro dos critérios de pedido mínimo e validade.</span>
+                          )}
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                          <a
+                            href={buildPhoneHref(comparisonResult.best.supplierPhone)}
+                            className="px-3 py-1.5 rounded-lg bg-emerald-900 hover:bg-emerald-800 border border-emerald-700 text-xs font-semibold text-white"
+                          >
+                            Ligar: {comparisonResult.best.supplierPhone}
+                          </a>
+                          <a
+                            href={buildWhatsAppHref(
+                              comparisonResult.best.supplierWhatsapp,
+                              `Olá! Aqui é da São Gabriel Massas (Japurá/PR). Gostaria de fechar pedido de ${comparisonResult.best.packagesNeeded}x ${comparisonResult.best.productName} no valor total de ${formatBRL(comparisonResult.best.totalRealCostCents)}.`
+                            )}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="px-3.5 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold"
+                          >
+                            Fechar no WhatsApp
+                          </a>
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="bg-amber-50 border border-amber-200 rounded-xl p-5 text-sm text-amber-900">
+                      Nenhuma oferta elegível atingiu o pedido mínimo para esta quantidade. Aumente o volume do pedido ou selecione um mercado local de Japurá (pedido mínimo a partir de R$ 10,00).
+                    </div>
+                  )}
+
+                  <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+                    <div className="px-5 py-3.5 border-b border-slate-200 bg-slate-50 flex items-center justify-between">
+                      <h3 className="text-xs font-bold uppercase tracking-wider text-slate-700">
+                        Ranking de Ofertas Elegíveis ({comparisonResult.eligible.length})
+                      </h3>
+                      <span className="text-[11px] text-slate-500">Ordenado pelo menor custo real total</span>
+                    </div>
+
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left border-collapse">
+                        <thead>
+                          <tr className="border-b border-slate-200 text-[11px] font-bold uppercase text-slate-500 bg-slate-50/50">
+                            <th className="py-2.5 px-4">Pos.</th>
+                            <th className="py-2.5 px-4">Fornecedor / Produto</th>
+                            <th className="py-2.5 px-4 text-right">Embalagens</th>
+                            <th className="py-2.5 px-4 text-right">Produtos</th>
+                            <th className="py-2.5 px-4 text-right">Frete</th>
+                            <th className="py-2.5 px-4 text-right">Custo Real</th>
+                            <th className="py-2.5 px-4 text-right">Unit. Efetivo</th>
+                            <th className="py-2.5 px-4 text-right">Contato</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100 text-xs">
+                          {comparisonResult.eligible.map((item, idx) => (
+                            <tr key={item.offerId} className={idx === 0 ? "bg-emerald-50/40" : "hover:bg-slate-50"}>
+                              <td className="py-3 px-4 font-bold">
+                                <span className={`inline-flex items-center justify-center w-6 h-6 rounded-full text-[11px] ${
+                                  idx === 0 ? "bg-emerald-600 text-white" : "bg-slate-200 text-slate-700"
+                                }`}>
+                                  {idx + 1}º
+                                </span>
+                              </td>
+                              <td className="py-3 px-4">
+                                <div className="font-bold text-slate-900">{item.supplierName}</div>
+                                <div className="text-slate-500">{item.productName}</div>
+                                <div className="text-[11px] text-slate-400 mt-0.5">{item.source} • Validade: {item.validUntil.split("-").reverse().join("/")}</div>
+                              </td>
+                              <td className="py-3 px-4 text-right font-mono-num">
+                                <div className="font-semibold">{item.packagesNeeded} emb.</div>
+                                <div className="text-[11px] text-slate-400">{item.deliveredBaseAmount} {item.deliveredDisplayUnit}</div>
+                              </td>
+                              <td className="py-3 px-4 text-right font-mono-num">
+                                <div>{formatBRL(item.netProductsCents)}</div>
+                                {item.discountPercentApplied > 0 && (
+                                  <div className="text-[10px] font-semibold text-emerald-700">-{item.discountPercentApplied}% vol.</div>
+                                )}
+                              </td>
+                              <td className="py-3 px-4 text-right font-mono-num">
+                                {item.freeFreightApplied ? (
+                                  <span className="px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800 font-bold text-[10px]">GRÁTIS</span>
+                                ) : (
+                                  formatBRL(item.freightCents)
+                                )}
+                              </td>
+                              <td className="py-3 px-4 text-right font-mono-num font-bold text-slate-900">
+                                {formatBRL(item.totalRealCostCents)}
+                              </td>
+                              <td className="py-3 px-4 text-right font-mono-num text-slate-700">
+                                {formatBRL(item.effectiveUnitCostCents)}/{item.deliveredDisplayUnit}
+                              </td>
+                              <td className="py-3 px-4 text-right">
+                                <a
+                                  href={buildWhatsAppHref(item.supplierWhatsapp, `Olá, cotação para São Gabriel Massas: ${item.productName}.`)}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="inline-block px-2.5 py-1 rounded bg-slate-900 hover:bg-slate-800 text-white font-semibold text-[11px]"
+                                >
+                                  WhatsApp
+                                </a>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  {comparisonResult.excluded.length > 0 && (
+                    <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-sm">
+                      <h4 className="text-xs font-bold uppercase tracking-wider text-rose-700 mb-2.5">
+                        Ofertas Bloqueadas pelas Regras de Auditoria ({comparisonResult.excluded.length})
+                      </h4>
+                      <div className="space-y-2">
+                        {comparisonResult.excluded.map((ex) => (
+                          <div key={ex.offerId} className="text-xs bg-rose-50/60 border border-rose-200/80 rounded-lg p-3 flex flex-wrap items-center justify-between gap-2">
+                            <div>
+                              <span className="font-bold text-slate-900">{ex.supplierName}</span> — <span className="text-slate-700">{ex.productName}</span>
+                              <p className="text-rose-700 mt-0.5">{ex.exclusionReasons.join(" ")}</p>
+                            </div>
+                            <span className="text-[11px] font-mono-num text-slate-500">{ex.supplierPhone}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                <aside className="lg:col-span-4 space-y-5">
+                  <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+                    <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500 mb-3">
+                      Resumo Executivo da Cotação
+                    </h3>
+                    <div className="space-y-3 text-xs">
+                      <div className="flex justify-between py-2 border-b border-slate-100">
+                        <span className="text-slate-500">Fornecedores Ativos:</span>
+                        <span className="font-bold font-mono-num">{suppliers.length} (5 em Japurá/PR)</span>
+                      </div>
+                      <div className="flex justify-between py-2 border-b border-slate-100">
+                        <span className="text-slate-500">Alertas de Preço Ativos:</span>
+                        <span className="font-bold font-mono-num text-amber-700">{priceAlerts.filter((a) => a.active).length} regras</span>
+                      </div>
+                      <div className="flex justify-between py-2 border-b border-slate-100">
+                        <span className="text-slate-500">Economia no Lote Atual:</span>
+                        <span className="font-bold font-mono-num text-emerald-700">
+                          {formatBRL(comparisonResult.savingsVsRunnerUpCents)}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="mt-4 pt-3 border-t border-slate-100">
+                      <div className="text-[11px] font-bold uppercase text-slate-500 mb-2">Metas de Preço Monitoradas</div>
+                      <div className="space-y-2">
+                        {priceAlerts.map((al) => (
+                          <div key={al.id} className="flex items-center justify-between text-xs bg-slate-50 px-3 py-2 rounded-lg border border-slate-200/80">
+                            <span className="font-medium text-slate-700">{al.label}</span>
+                            <span className="h-2 w-2 rounded-full bg-emerald-500" title="Monitorando"></span>
+                          </div>
+                        ))}
+                      </div>
+                      <button
+                        onClick={() => setActiveTab("alerts")}
+                        className="mt-3 w-full py-2 rounded-lg border border-slate-300 hover:bg-slate-50 text-xs font-semibold text-slate-700"
+                      >
+                        Configurar Alertas de Preço
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+                    <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500 mb-3">
+                      Contatos Diretos • Japurá / PR
+                    </h3>
+                    <div className="space-y-2.5">
+                      {suppliers
+                        .filter((s) => s.city.includes("Japurá"))
+                        .map((s) => (
+                          <div key={s.id} className="p-2.5 rounded-lg border border-slate-200/90 hover:border-slate-300 flex items-center justify-between gap-2">
+                            <div>
+                              <div className="text-xs font-bold text-slate-900">{s.name.replace(" (Japurá)", "")}</div>
+                              <div className="text-[11px] font-mono-num text-slate-500">{s.phone}</div>
+                            </div>
+                            <a
+                              href={buildWhatsAppHref(s.whatsapp, `Olá ${s.contactName}, cotação para São Gabriel Massas.`)}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="px-2.5 py-1 rounded bg-emerald-600 hover:bg-emerald-700 text-white text-[11px] font-semibold"
+                            >
+                              WhatsApp
+                            </a>
+                          </div>
+                        ))}
+                    </div>
+                  </div>
+                </aside>
+              </div>
+            )}
+
+            {activeTab === "market" && (
+              <div className="space-y-5">
+                <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+                  <div className="flex flex-wrap items-center justify-between gap-3 pb-4 mb-4 border-b border-slate-100">
+                    <div>
+                      <h2 className="text-base font-bold text-slate-900">Pesquisa de Preços: Supermercados de Japurá, Paraná e Brasil</h2>
+                      <p className="text-xs text-slate-500">Consulte preços nas unidades locais (Vip, O Bom Preço, Ronqui, São João, União), atacados do Paraná e distribuidores nacionais.</p>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <label className="text-xs font-semibold text-slate-600">Vincular importação ao grupo:</label>
+                      <select
+                        value={targetGroupForImport}
+                        onChange={(e) => setTargetGroupForImport(e.target.value)}
+                        className="rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs font-semibold bg-white"
+                      >
+                        {groups.map((g) => (
+                          <option key={g.id} value={g.id}>{g.name}</option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-12 gap-3">
+                    <div className="md:col-span-6">
+                      <input
+                        type="text"
+                        value={marketQuery}
+                        onChange={(e) => setMarketQuery(e.target.value)}
+                        placeholder="Buscar por produto, marca ou supermercado (ex: farinha, óleo, vip, ronqui, coamo)..."
+                        className="w-full rounded-lg border border-slate-300 px-3.5 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500"
+                      />
+                    </div>
+                    <div className="md:col-span-6 flex flex-wrap gap-1.5">
+                      {[
+                        { id: "all", label: "Todas as Fontes" },
+                        { id: "japura", label: "Supermercados Japurá (PR)" },
+                        { id: "pr", label: "Atacados Paraná" },
+                        { id: "br", label: "Nacional (Brasil)" },
+                      ].map((sc) => (
+                        <button
+                          key={sc.id}
+                          onClick={() => setMarketScope(sc.id)}
+                          className={`px-3 py-2 rounded-lg text-xs font-semibold border transition ${
+                            marketScope === sc.id
+                              ? "bg-slate-900 text-white border-slate-900"
+                              : "bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100"
+                          }`}
+                        >
+                          {sc.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {filteredMarketItems.map((item) => (
+                    <div key={item.id} className="bg-white rounded-xl border border-slate-200 p-4 shadow-sm flex flex-col justify-between">
+                      <div>
+                        <div className="flex items-center justify-between gap-2 mb-2">
+                          <span className={`text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded ${
+                            item.scope === "japura"
+                              ? "bg-amber-100 text-amber-900"
+                              : item.scope === "pr"
+                              ? "bg-blue-100 text-blue-900"
+                              : "bg-slate-200 text-slate-800"
+                          }`}>
+                            {item.scope === "japura" ? "Japurá • Local" : item.scope === "pr" ? "Regional PR" : "Brasil"}
+                          </span>
+                          <span className="text-[11px] text-slate-400">{item.updated}</span>
+                        </div>
+
+                        <div className="text-xs font-bold text-slate-500">{item.channel}</div>
+                        <h3 className="text-sm font-bold text-slate-900 mt-0.5">{item.title}</h3>
+                        <p className="text-[11px] text-slate-500 mt-1">{item.region} • Prazo: {item.transitDays === 0 ? "Retirada / Entrega Hoje" : `${item.transitDays} dia(s)`}</p>
+
+                        <div className="mt-3 pt-3 border-t border-slate-100 flex items-baseline justify-between">
+                          <div>
+                            <div className="text-[11px] text-slate-400">Preço da Embalagem ({item.packQty} {item.packUnit})</div>
+                            <div className="text-lg font-extrabold font-mono-num text-slate-900">{formatBRL(item.priceCents)}</div>
+                          </div>
+                          <div className="text-right">
+                            <div className="text-[11px] text-slate-400">Frete Est.</div>
+                            <div className="text-xs font-mono-num font-semibold text-slate-700">
+                              {item.freightCents === 0 ? "Grátis / Balcão" : formatBRL(item.freightCents)}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="mt-4 pt-3 border-t border-slate-100 flex items-center gap-2">
+                        <button
+                          onClick={() => handleImportMarketOffer(item)}
+                          className="flex-1 py-2 px-3 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold transition"
+                        >
+                          Usar no Comparador
+                        </button>
+                        <a
+                          href={buildWhatsAppHref(item.whatsapp, `Olá! Gostaria de confirmar estoque e preço de: ${item.title} para a São Gabriel Massas.`)}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="py-2 px-3 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold"
+                          title={`Telefone: ${item.phone}`}
+                        >
+                          WhatsApp
+                        </a>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {activeTab === "alerts" && (
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                <div className="lg:col-span-5 bg-white rounded-xl border border-slate-200 p-5 shadow-sm h-fit">
+                  <h2 className="text-base font-bold text-slate-900">Criar Alerta de Preço-Alvo</h2>
+                  <p className="text-xs text-slate-500 mt-1 mb-4">
+                    Sempre que qualquer fornecedor, XML de NF-e ou supermercado de Japurá registrar preço igual ou menor que a sua meta, o sistema emite notificação imediata.
+                  </p>
+
+                  <form onSubmit={handleCreateAlert} className="space-y-3.5">
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-700 mb-1">Produto / Grupo Monitorado</label>
+                      <select
+                        value={newAlertGroupId}
+                        onChange={(e) => setNewAlertGroupId(e.target.value)}
+                        className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold bg-white"
+                      >
+                        {groups.map((g) => (
+                          <option key={g.id} value={g.id}>{g.name} (por {g.baseUnit})</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-700 mb-1">Notificar quando o preço unitário for menor ou igual a (R$)</label>
+                      <input
+                        type="text"
+                        value={newAlertTargetPrice}
+                        onChange={(e) => setNewAlertTargetPrice(e.target.value)}
+                        placeholder="Ex: 3,35"
+                        className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono-num font-bold"
+                      />
+                    </div>
+
+                    <button
+                      type="submit"
+                      className="w-full py-2.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs transition"
+                    >
+                      Ativar Monitoramento de Preço
+                    </button>
+                  </form>
+
+                  <div className="mt-5 pt-4 border-t border-slate-100">
+                    <div className="text-xs font-bold text-slate-800 mb-1">Notificações no Computador / Celular</div>
+                    <p className="text-[11px] text-slate-500 mb-2.5">
+                      Status atual: <strong>{browserNotifPermission === "granted" ? "Ativadas" : "Aguardando permissão"}</strong>
+                    </p>
+                    <button
+                      type="button"
+                      onClick={requestBrowserNotification}
+                      className="w-full py-2 rounded-lg border border-slate-300 hover:bg-slate-50 text-xs font-semibold text-slate-800"
+                    >
+                      Ativar Notificações Pop-up do Navegador
+                    </button>
+                  </div>
+                </div>
+
+                <div className="lg:col-span-7 space-y-5">
+                  <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+                    <h3 className="text-xs font-bold uppercase tracking-wider text-slate-600 mb-3">
+                      Regras de Alerta Ativas ({priceAlerts.length})
+                    </h3>
+                    <div className="space-y-2.5">
+                      {priceAlerts.map((al) => (
+                        <div key={al.id} className="p-3 rounded-lg border border-slate-200 flex items-center justify-between gap-3">
+                          <div>
+                            <div className="text-xs font-bold text-slate-900">{al.label}</div>
+                            <div className="text-[11px] text-slate-500">Monitorando cotações, XML NF-e e supermercados de Japurá</div>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <button
+                              onClick={() =>
+                                setPriceAlerts((prev) =>
+                                  prev.map((item) => (item.id === al.id ? { ...item, active: !item.active } : item))
+                                )
+                              }
+                              className={`px-2.5 py-1 rounded text-[11px] font-bold ${
+                                al.active ? "bg-emerald-100 text-emerald-800" : "bg-slate-200 text-slate-600"
+                              }`}
+                            >
+                              {al.active ? "Ativo" : "Pausado"}
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+                    <h3 className="text-xs font-bold uppercase tracking-wider text-slate-600 mb-3">
+                      Histórico de Notificações de Queda de Preço
+                    </h3>
+                    <div className="space-y-3">
+                      {notifications.map((n) => {
+                        const sup = suppliers.find((s) => s.id === n.supplierId);
+                        return (
+                          <div key={n.id} className="p-3.5 rounded-lg bg-emerald-50/60 border border-emerald-200 flex flex-wrap items-center justify-between gap-3">
+                            <div className="max-w-lg">
+                              <div className="text-xs font-bold text-emerald-900">{n.title} <span className="font-normal text-slate-500">• {n.timestamp}</span></div>
+                              <p className="text-xs text-slate-700 mt-1">{n.message}</p>
+                            </div>
+                            {sup && (
+                              <a
+                                href={buildWhatsAppHref(sup.whatsapp, `Olá ${sup.contactName}, recebi alerta de preço da São Gabriel Massas e quero fechar pedido.`)}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold"
+                              >
+                                Chamar no WhatsApp
+                              </a>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {activeTab === "suppliers" && (
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                <div className="lg:col-span-4 bg-white rounded-xl border border-slate-200 p-5 shadow-sm h-fit">
+                  <h2 className="text-base font-bold text-slate-900 mb-1">Cadastrar Fornecedor / Mercado</h2>
+                  <p className="text-xs text-slate-500 mb-4">Inclua número de telefone e WhatsApp para negociação direta.</p>
+                  <form onSubmit={handleAddSupplier} className="space-y-3">
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-700 mb-1">Razão Social / Nome Fantasia</label>
+                      <input type="text" required value={newSupplierName} onChange={(e) => setNewSupplierName(e.target.value)} placeholder="Ex: Supermercado Central Japurá" className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs" />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-700 mb-1">Cidade / Endereço</label>
+                      <input type="text" value={newSupplierCity} onChange={(e) => setNewSupplierCity(e.target.value)} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs" />
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <div>
+                        <label className="block text-xs font-semibold text-slate-700 mb-1">Telefone Fixo</label>
+                        <input type="text" value={newSupplierPhone} onChange={(e) => setNewSupplierPhone(e.target.value)} placeholder="(44) 3635-0000" className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs" />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-semibold text-slate-700 mb-1">WhatsApp</label>
+                        <input type="text" value={newSupplierWhatsapp} onChange={(e) => setNewSupplierWhatsapp(e.target.value)} placeholder="(44) 99999-0000" className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs" />
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <div>
+                        <label className="block text-xs font-semibold text-slate-700 mb-1">Pedido Mínimo (R$)</label>
+                        <input type="text" value={newSupplierMinOrder} onChange={(e) => setNewSupplierMinOrder(e.target.value)} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs font-mono-num" />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-semibold text-slate-700 mb-1">Frete Grátis Acima (R$)</label>
+                        <input type="text" value={newSupplierFreeFreight} onChange={(e) => setNewSupplierFreeFreight(e.target.value)} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs font-mono-num" />
+                      </div>
+                    </div>
+                    <button type="submit" disabled={!role.canEditMaster} className="w-full py-2.5 rounded-lg bg-slate-900 hover:bg-slate-800 disabled:opacity-40 text-white font-bold text-xs">
+                      Salvar Fornecedor
+                    </button>
+                  </form>
+                </div>
+
+                <div className="lg:col-span-8 bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+                  <div className="px-5 py-3.5 border-b border-slate-200 bg-slate-50">
+                    <h3 className="text-xs font-bold uppercase tracking-wider text-slate-700">Base Cadastrada de Fornecedores & Supermercados</h3>
+                  </div>
+                  <div className="divide-y divide-slate-100">
+                    {suppliers.map((s) => (
+                      <div key={s.id} className="p-4 flex flex-wrap items-center justify-between gap-3 hover:bg-slate-50">
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm font-bold text-slate-900">{s.name}</span>
+                            {s.city.includes("Japurá") && (
+                              <span className="text-[10px] font-bold uppercase px-2 py-0.5 rounded bg-amber-100 text-amber-900">Japurá - PR</span>
+                            )}
+                          </div>
+                          <div className="text-xs text-slate-500 mt-0.5">{s.city} • Contato: {s.contactName}</div>
+                          <div className="text-[11px] font-mono-num text-slate-500 mt-1">
+                            Pedido mín.: {formatBRL(s.minOrderCents)} • Frete grátis: {s.freeFreightMinCents ? formatBRL(s.freeFreightMinCents) : "Não possui"}
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                          <a href={buildPhoneHref(s.phone)} className="px-3 py-1.5 rounded-lg border border-slate-300 text-xs font-mono-num font-semibold text-slate-700 hover:bg-slate-100">
+                            {s.phone}
+                          </a>
+                          <a
+                            href={buildWhatsAppHref(s.whatsapp, `Olá ${s.contactName}, cotação comercial para São Gabriel Massas.`)}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold"
+                          >
+                            WhatsApp
+                          </a>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {activeTab === "offers" && (
+              <div className="max-w-2xl mx-auto bg-white rounded-xl border border-slate-200 p-6 shadow-sm">
+                <h2 className="text-base font-bold text-slate-900 mb-1">Registrar Nova Cotação / Preço de Balcão</h2>
+                <p className="text-xs text-slate-500 mb-4">Se o preço informado ficar abaixo da meta configurada, um alerta será disparado automaticamente.</p>
+                <form onSubmit={handleAddOffer} className="space-y-4">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-700 mb-1">Fornecedor / Supermercado</label>
+                      <select value={newOfferSupplierId} onChange={(e) => setNewOfferSupplierId(e.target.value)} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold bg-white">
+                        {suppliers.map((s) => (
+                          <option key={s.id} value={s.id}>{s.name}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-700 mb-1">Produto / Embalagem</label>
+                      <select value={newOfferProductId} onChange={(e) => setNewOfferProductId(e.target.value)} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold bg-white">
+                        {products.map((p) => (
+                          <option key={p.id} value={p.id}>{p.name}</option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-700 mb-1">Preço da Embalagem (R$)</label>
+                      <input type="text" required value={newOfferPrice} onChange={(e) => setNewOfferPrice(e.target.value)} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono-num font-bold" />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-700 mb-1">Frete Total (R$)</label>
+                      <input type="text" value={newOfferFreight} onChange={(e) => setNewOfferFreight(e.target.value)} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono-num" />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-700 mb-1">Validade da Proposta</label>
+                      <input type="date" value={newOfferValidUntil} onChange={(e) => setNewOfferValidUntil(e.target.value)} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs" />
+                    </div>
+                  </div>
+
+                  <button type="submit" disabled={!role.canCreateOffers} className="w-full py-2.5 rounded-lg bg-slate-900 hover:bg-slate-800 disabled:opacity-40 text-white font-bold text-xs">
+                    Salvar Cotação e Avaliar Custo Real
+                  </button>
+                </form>
+              </div>
+            )}
+
+            {activeTab === "xml" && (
+              <div className="max-w-3xl mx-auto bg-white rounded-xl border border-slate-200 p-6 shadow-sm space-y-4">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h2 className="text-base font-bold text-slate-900">Importação de XML de Nota Fiscal Eletrônica (NF-e)</h2>
+                    <p className="text-xs text-slate-500">Extrai automaticamente emitente, telefone, valor unitário e frete para alimentar o comparador e verificar alertas.</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setXmlText(SAMPLE_NFE_XML);
+                      handleParseXml(SAMPLE_NFE_XML);
+                    }}
+                    className="px-3 py-1.5 rounded-lg bg-amber-100 hover:bg-amber-200 text-amber-950 text-xs font-bold"
+                  >
+                    Carregar XML Exemplo (Coamo)
+                  </button>
+                </div>
+
+                <div>
+                  <input
+                    type="file"
+                    accept=".xml"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      if (!file) return;
+                      const reader = new FileReader();
+                      reader.onload = (ev) => {
+                        const content = String(ev.target?.result || "");
+                        setXmlText(content);
+                        handleParseXml(content);
+                      };
+                      reader.readAsText(file);
+                    }}
+                    className="block w-full text-xs text-slate-600 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-slate-900 file:text-white hover:file:bg-slate-800"
+                  />
+                </div>
+
+                <textarea
+                  rows="6"
+                  value={xmlText}
+                  onChange={(e) => {
+                    setXmlText(e.target.value);
+                    if (e.target.value.includes("<NFe")) handleParseXml(e.target.value);
+                  }}
+                  placeholder="Cole aqui o conteúdo XML da NF-e ou selecione o arquivo acima..."
+                  className="w-full rounded-lg border border-slate-300 p-3 text-xs font-mono-num"
+                />
+
+                {parsedXmlPreview && (
+                  <div className="p-4 rounded-xl bg-emerald-50 border border-emerald-200 flex flex-wrap items-center justify-between gap-4">
+                    <div className="text-xs space-y-1">
+                      <div className="font-bold text-emerald-950">NF-e #{parsedXmlPreview.nfeNumber} • {parsedXmlPreview.supplierName}</div>
+                      <div className="text-slate-700">Item: {parsedXmlPreview.productName}</div>
+                      <div className="font-mono-num text-slate-800">
+                        Valor Unitário: <strong>{formatBRL(parsedXmlPreview.unitPriceCents)}</strong> • Frete: <strong>{formatBRL(parsedXmlPreview.freightCents)}</strong>
+                      </div>
+                    </div>
+                    <button
+                      onClick={handleImportParsedXml}
+                      className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold"
+                    >
+                      Confirmar e Enviar ao Comparador
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+          </main>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App />);
+  </script>
+</body>
+</html>
